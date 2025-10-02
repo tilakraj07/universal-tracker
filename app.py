@@ -215,22 +215,32 @@ with st.spinner("Fetching data…"):
         if below_stop: push_alert("STOP",f"⛔ {sym}: {last_price:.2f} ≤ Stop {stop:.2f}")
         if above_target: push_alert("TARGET",f"🎯 {sym}: {last_price:.2f} ≥ Target {target:.2f}")
 
+        # Add explanation for highlight color
+        signal_note = ""
+        if pd.notna(pl_pct) and pl_pct <= -5:
+            signal_note = "Loss >5% (Red)"
+        elif pd.notna(pl_pct) and pl_pct >= 10:
+            signal_note = "Gain >10% (Green)"
+        elif pd.notna(pct2) and pct2 >= 3:
+            signal_note = "2D +3% (Blue)"
+
         rows.append({
             "Symbol":sym,
+            "Signal":signal_note,
             "2D %":None if pct2 is None else round(pct2,2),
             "5D %":None if pct5 is None else round(pct5,2),
             "7D %":None if pct7 is None else round(pct7,2),
-            "Current Price":None if not last_price else round(last_price,4),
-            "200 EMA (3h)":None if ema200_val is None else round(ema200_val,4),
+            "Current Price":None if not last_price else round(last_price,2),
+            "200 EMA (3h)":None if ema200_val is None else round(ema200_val,2),
             "Price vs 200 EMA (3h)":ema_state,
-            "MACD (daily)":round(macd_val,5),
-            "MACD Signal (daily)":round(macd_sig,5),
-            "MACD Hist (daily)":round(macd_hist,5),
+            "MACD (daily)":round(macd_val,2),
+            "MACD Signal (daily)":round(macd_sig,2),
+            "MACD Hist (daily)":round(macd_hist,2),
             "MACD Trend (daily)":macd_state,
-            "Quantity":None if pd.isna(qty) else float(qty),
-            "Purchase Price":None if pd.isna(buy) else float(buy),
-            "Stop Level":None if pd.isna(stop) else float(stop),
-            "Target Price":None if pd.isna(target) else float(target),
+            "Quantity":None if pd.isna(qty) else round(float(qty),2),
+            "Purchase Price":None if pd.isna(buy) else round(float(buy),2),
+            "Stop Level":None if pd.isna(stop) else round(float(stop),2),
+            "Target Price":None if pd.isna(target) else round(float(target),2),
             "P/L %":None if pl_pct is None else round(pl_pct,2),
             "P/L Amount":None if pl_amt is None else round(pl_amt,2),
             "Notes":notes
@@ -238,7 +248,13 @@ with st.spinner("Fetching data…"):
 
 df_table = pd.DataFrame(rows)
 
-# Highlighting only Symbol
+# Reorder to ensure Signal is right after Symbol
+if "Signal" in df_table.columns and "Symbol" in df_table.columns:
+    cols = df_table.columns.tolist()
+    cols.insert(cols.index("Symbol")+1, cols.pop(cols.index("Signal")))
+    df_table = df_table[cols]
+
+# Highlight Symbol column
 def highlight_symbol(row):
     color = ""
     if pd.notna(row.get("P/L %")) and row["P/L %"] <= -5:
@@ -249,7 +265,15 @@ def highlight_symbol(row):
         color = "background-color: lightblue"
     return [color if col=="Symbol" else "" for col in df_table.columns]
 
-styled_table = df_table.style.apply(highlight_symbol, axis=1)
+# Format with % signs for specific columns
+format_dict = {
+    "2D %": "{:.2f}%",
+    "5D %": "{:.2f}%",
+    "7D %": "{:.2f}%",
+    "P/L %": "{:.2f}%"
+}
+
+styled_table = df_table.style.apply(highlight_symbol, axis=1).format(format_dict).format(precision=2)
 
 # ---------------------------------
 # Alerts Panel with Reset
