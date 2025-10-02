@@ -167,21 +167,14 @@ if "sent_alerts" not in st.session_state:
 st.sidebar.markdown(f"**Last refreshed:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # ---------------------------------
-# Portfolio editor
+# Portfolio editor (NO column_config → Option A)
 # ---------------------------------
 st.subheader("Edit your portfolio")
 edited = st.data_editor(
     st.session_state.portfolio,
     num_rows="dynamic",
     use_container_width=True,
-    key="portfolio_editor",
-    column_config={
-        "Quantity": st.column_config.NumberColumn(format="%.4f", step=1.0),
-        "Purchase Price": st.column_config.NumberColumn(format="%.4f", step=0.01),
-        "Stop Level": st.column_config.NumberColumn(format="%.4f", step=0.01),
-        "Target Price": st.column_config.NumberColumn(format="%.4f", step=0.01),
-        "Notes": st.column_config.TextColumn(),
-    }
+    key="portfolio_editor"
 )
 st.session_state.portfolio = edited.copy()
 
