@@ -29,33 +29,40 @@ tg_token  = "8298370446:AAHQJdZpq1TZumNG3tacLpBnH6Ge6cCJU3o"
 tg_chat   = "888880398"
 
 def send_telegram(msg: str):
-    if not (tg_enable and tg_token and tg_chat): return
+    if not (tg_enable and tg_token and tg_chat): 
+        return
     try:
         url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
         requests.post(url, json={"chat_id": tg_chat, "text": msg})
-    except Exception: pass
+    except Exception:
+        pass
 
 # ---------------------------------
 # Alerts log persistence (12h throttle)
 # ---------------------------------
 def load_alert_log():
     if os.path.exists(ALERTS_LOG):
-        try: return pd.read_csv(ALERTS_LOG, parse_dates=["timestamp"])
-        except: pass
+        try:
+            return pd.read_csv(ALERTS_LOG, parse_dates=["timestamp"])
+        except:
+            pass
     return pd.DataFrame(columns=["key","timestamp"])
 
 def save_alert_log(df): 
-    try: df.to_csv(ALERTS_LOG, index=False)
-    except: pass
+    try:
+        df.to_csv(ALERTS_LOG, index=False)
+    except:
+        pass
 
 alert_log = load_alert_log()
 THROTTLE_HOURS = 12
 
 def alert_recent(key):
-    if alert_log.empty: return False
-    recent = alert_log[alert_log["key"]]==key
-    recent = alert_log[alert_log["key"]==key]
-    if recent.empty: return False
+    if alert_log.empty:
+        return False
+    recent = alert_log[alert_log["key"] == key]   # ✅ fixed line
+    if recent.empty:
+        return False
     return (datetime.now()-recent["timestamp"].max()) < timedelta(hours=THROTTLE_HOURS)
 
 def record_alert(key):
@@ -96,12 +103,14 @@ def fetch_1m_price(sym):
     df = yf.download(sym, period="2d", interval="1m", progress=False, auto_adjust=False)
     return float(df["Close"].iloc[-1]) if not df.empty else None
 
-def is_crypto(sym): return str(sym).upper().endswith("-USD")
+def is_crypto(sym): 
+    return str(sym).upper().endswith("-USD")
 
 # ---------------------------------
 # Indicators
 # ---------------------------------
-def ema(s, span): return s.ewm(span=span, adjust=False).mean()
+def ema(s, span): 
+    return s.ewm(span=span, adjust=False).mean()
 
 def macd(series):
     ema12, ema26 = ema(series,12), ema(series,26)
@@ -112,9 +121,11 @@ def macd(series):
 
 def macd_trend_daily(sym):
     df = fetch_daily(sym)
-    if df.empty or "Close" not in df: return "None",0,0,0
+    if df.empty or "Close" not in df: 
+        return "None",0,0,0
     close = pd.to_numeric(df["Close"], errors="coerce").dropna()
-    if len(close)<30: return "None",0,0,0
+    if len(close)<30: 
+        return "None",0,0,0
     macd_line, signal, hist = macd(close)
     c,s,h = float(macd_line.iloc[-1]), float(signal.iloc[-1]), float(hist.iloc[-1])
     return ("Bullish" if c>s else "Bearish" if c<s else "None"), c,s,h
@@ -141,8 +152,10 @@ DEFAULT_SYMBOLS = ["RELIANCE.NS","HDFCBANK.NS","TCS.NS","BTC-USD","XAUUSD=X"]
 
 def load_portfolio():
     if os.path.exists(PORTFOLIO_CSV):
-        try: return pd.read_csv(PORTFOLIO_CSV)
-        except: pass
+        try: 
+            return pd.read_csv(PORTFOLIO_CSV)
+        except: 
+            pass
     return pd.DataFrame({
         "Symbol":DEFAULT_SYMBOLS,"Quantity":np.nan,"Purchase Price":np.nan,
         "Stop Level":np.nan,"Target Price":np.nan,"Notes":""
@@ -172,7 +185,7 @@ with st.spinner("Fetching data…"):
         # Price from fast feed
         last_price = fetch_1m_price(sym) if is_crypto(sym) else fetch_15m_price(sym)
 
-        # Determine EMA state (using last_price)
+        # Determine EMA state
         ema_state = "N/A"
         if ema200_val and last_price:
             ema_state = "Above" if last_price > ema200_val else "Below"
@@ -180,7 +193,7 @@ with st.spinner("Fetching data…"):
         # MACD daily
         macd_state, macd_val, macd_sig, macd_hist = macd_trend_daily(sym)
 
-        # Daily pct change
+        # Daily % changes
         df_daily = fetch_daily(sym, period="90d")
         pct2=pct5=pct7=None
         if not df_daily.empty:
@@ -216,10 +229,8 @@ with st.spinner("Fetching data…"):
         if below_stop: push_alert("STOP",f"⛔ {sym}: {last_price:.2f} ≤ Stop {stop:.2f}")
         if above_target: push_alert("TARGET",f"🎯 {sym}: {last_price:.2f} ≥ Target {target:.2f}")
 
-        # ----- Signal (text) and highlight color selection -----
-        # Priority: P/L conditions (Green/Red) override Blue. If no purchase price, only Blue can trigger.
+        # ----- Signal Logic -----
         signal_note = ""
-
         if pd.notna(pl_pct):
             if pl_pct <= -10:
                 signal_note = "Loss >10%"
@@ -257,14 +268,13 @@ with st.spinner("Fetching data…"):
 
 df_table = pd.DataFrame(rows)
 
-# Ensure Signal is right after Symbol
+# Ensure Signal column is right after Symbol
 if "Signal" in df_table.columns and "Symbol" in df_table.columns:
     cols = df_table.columns.tolist()
     cols.insert(cols.index("Symbol")+1, cols.pop(cols.index("Signal")))
     df_table = df_table[cols]
 
-# Highlight Symbol column using the *numeric* columns (not the string text),
-# with your latest rules: Red ≤ -5%, Green ≥ 5%, Blue if abs(2D%) ≥ 3
+# Highlight Symbol column
 def highlight_symbol(row):
     red = pd.notna(row.get("P/L %")) and row["P/L %"] <= -5
     green = pd.notna(row.get("P/L %")) and row["P/L %"] >= 5
@@ -278,7 +288,7 @@ def highlight_symbol(row):
         color = "background-color: lightblue"
     return [color if col=="Symbol" else "" for col in df_table.columns]
 
-# Format with % signs for specific columns
+# Format with % signs
 format_dict = {
     "2D %": "{:.2f}%",
     "5D %": "{:.2f}%",
