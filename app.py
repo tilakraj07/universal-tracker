@@ -1,33 +1,31 @@
 # ==============================================
-# UNIVERSAL TRACKER — Portfolio + Intraday + Alerts + Telegram (Hardcoded)
+# UNIVERSAL TRACKER — Portfolio + Intraday + Alerts (12h throttle) + Telegram (hardcoded)
 # ==============================================
-# HOW TO RUN LOCALLY:
-# 1) Save this as app.py
-# 2) pip install streamlit streamlit-autorefresh yfinance pandas numpy requests
-# 3) python -m streamlit run app.py
-#
-# HOW TO DEPLOY (Streamlit Cloud):
-# - Push app.py + requirements.txt to GitHub
-# - Deploy at https://share.streamlit.io
+# RUN LOCALLY:
+#   pip install streamlit streamlit-autorefresh yfinance pandas numpy requests
+#   python -m streamlit run app.py
+# DEPLOY:
+#   Push app.py + requirements.txt to GitHub, deploy on https://share.streamlit.io
 # ==============================================
 
 import os
 import hashlib
-from datetime import datetime
 import pandas as pd
 import numpy as np
 import yfinance as yf
 import streamlit as st
 import requests
+from datetime import datetime, timedelta
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Universal Tracker — Portfolio + Intraday + Alerts", layout="wide")
-st.title("📊 Universal Tracker — Portfolio + Intraday + Alerts (Telegram Enabled)")
+st.set_page_config(page_title="Universal Tracker — Intraday + Alerts", layout="wide")
+st.title("📊 Universal Tracker — Intraday + Alerts (Telegram, 12h Throttle)")
 
-# ---- Auto-refresh every 15 minutes ----
+# Auto-refresh every 15 minutes
 st_autorefresh(interval=900_000, key="auto15min")
 
 PORTFOLIO_CSV = "portfolio.csv"
+ALERTS_LOG = "alerts_log.csv"   # persists alert history across refreshes
 
 # ---------------------------------
 # Telegram setup (HARDCODED)
@@ -43,7 +41,56 @@ def send_telegram(msg: str):
         url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
         requests.post(url, json={"chat_id": tg_chat, "text": msg})
     except Exception:
-        pass  # don't crash if Telegram fails
+        pass  # never crash app for Telegram issues
+
+# ---------------------------------
+# Alerts log persistence (12h throttle)
+# ---------------------------------
+def load_alert_log() -> pd.DataFrame:
+    if os.path.exists(ALERTS_LOG):
+        try:
+            df = pd.read_csv(ALERTS_LOG, parse_dates=["timestamp"])
+            return df
+        except Exception:
+            pass
+    return pd.DataFrame(columns=["key", "timestamp"])
+
+def save_alert_log(df: pd.DataFrame):
+    try:
+        df.to_csv(ALERTS_LOG, index=False)
+    except Exception:
+        pass
+
+alert_log = load_alert_log()
+
+THROTTLE_HOURS = 12  # <= your request: 1 alert per rule per 12h per asset
+
+def alert_recent(key: str) -> bool:
+    """True if this key fired within last THROTTLE_HOURS."""
+    if alert_log.empty:
+        return False
+    recent = alert_log[alert_log["key"] == key]
+    if recent.empty:
+        return False
+    last_time = recent["timestamp"].max()
+    return (datetime.now() - last_time) < timedelta(hours=THROTTLE_HOURS)
+
+def record_alert(key: str):
+    global alert_log
+    new_row = pd.DataFrame([{"key": key, "timestamp": datetime.now()}])
+    alert_log = pd.concat([alert_log, new_row], ignore_index=True)
+    save_alert_log(alert_log)
+
+# Sidebar
+st.sidebar.markdown(f"**Last refreshed:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+if st.sidebar.button("🔄 Reset Alerts Log"):
+    try:
+        if os.path.exists(ALERTS_LOG):
+            os.remove(ALERTS_LOG)
+        alert_log = pd.DataFrame(columns=["key", "timestamp"])
+        st.sidebar.success("Alert history cleared ✅")
+    except Exception as e:
+        st.sidebar.error(f"Could not clear log: {e}")
 
 # ---------------------------------
 # Helpers & classification
@@ -54,51 +101,48 @@ def asset_kind(sym: str) -> str:
         return "stock"
     if s.endswith("-USD"):
         return "crypto"
-    if s in {"GC=F", "SI=F"} or s.endswith("=F"):
+    if s.endswith("=F") or s in {"GC=F", "SI=F"}:
         return "futures"
     if s.endswith("=X"):
         return "fx"
     return "other"
 
-# ---------------------------------
-# CACHED FETCHERS
-# ---------------------------------
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)  # 15m cache for stocks/metals
 def fetch_intraday_general(ticker: str, period="60d", interval="15m") -> pd.DataFrame:
     try:
         df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
-        if df is None or df.empty: return pd.DataFrame()
+        if df is None or df.empty:
+            return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         return df.dropna()
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)  # 1m cache for crypto
 def fetch_intraday_crypto(ticker: str, period="7d", interval="1m") -> pd.DataFrame:
     try:
         df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
-        if df is None or df.empty: return pd.DataFrame()
+        if df is None or df.empty:
+            return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         return df.dropna()
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)  # daily for % changes
 def fetch_daily(ticker: str, period="90d") -> pd.DataFrame:
     try:
         df = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=False)
-        if df is None or df.empty: return pd.DataFrame()
+        if df is None or df.empty:
+            return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         return df.dropna()
     except Exception:
         return pd.DataFrame()
 
-# ---------------------------------
-# Indicators
-# ---------------------------------
 def ema(s: pd.Series, span: int) -> pd.Series:
     return s.ewm(span=span, adjust=False).mean()
 
@@ -125,7 +169,7 @@ def macd_cross_state(close: pd.Series) -> tuple[str, float, float, float]:
     return cross_state, curr_macd, curr_sig, float(hist.iloc[-1])
 
 # ---------------------------------
-# Defaults & fallback
+# Defaults & persistence
 # ---------------------------------
 DEFAULT_SYMBOLS = [
     "RELIANCE.NS", "HDFCBANK.NS", "TCS.NS", "INFY.NS", "ICICIBANK.NS",
@@ -134,18 +178,13 @@ DEFAULT_SYMBOLS = [
 ]
 FALLBACK = {"XAUUSD=X": "GC=F", "XAGUSD=X": "SI=F"}
 
-st.caption("Intraday: Stocks/Metals 15m, Crypto 1m. Auto-refresh every 15 min. Telegram alerts enabled.")
-
-# ---------------------------------
-# Portfolio persistence
-# ---------------------------------
 def load_or_init_portfolio() -> pd.DataFrame:
     if os.path.exists(PORTFOLIO_CSV):
         try:
             df = pd.read_csv(PORTFOLIO_CSV)
             for col in ["Symbol","Quantity","Purchase Price","Stop Level","Target Price","Notes"]:
                 if col not in df.columns:
-                    df[col] = np.nan if col not in ["Notes"] else ""
+                    df[col] = np.nan if col != "Notes" else ""
             return df[["Symbol","Quantity","Purchase Price","Stop Level","Target Price","Notes"]]
         except Exception:
             pass
@@ -161,13 +200,8 @@ def load_or_init_portfolio() -> pd.DataFrame:
 if "portfolio" not in st.session_state:
     st.session_state.portfolio = load_or_init_portfolio()
 
-if "sent_alerts" not in st.session_state:
-    st.session_state.sent_alerts = set()
-
-st.sidebar.markdown(f"**Last refreshed:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
 # ---------------------------------
-# Portfolio editor (NO column_config → Option A)
+# Editor (no column_config for max compatibility)
 # ---------------------------------
 st.subheader("Edit your portfolio")
 edited = st.data_editor(
@@ -178,9 +212,10 @@ edited = st.data_editor(
 )
 st.session_state.portfolio = edited.copy()
 
-# Autosave
+# Autosave portfolio
 def df_hash(df: pd.DataFrame) -> str:
     return hashlib.sha256(pd.util.hash_pandas_object(df.fillna(""), index=False).values).hexdigest()
+
 if "last_save_hash" not in st.session_state:
     st.session_state.last_save_hash = ""
 cur_hash = df_hash(st.session_state.portfolio)
@@ -193,21 +228,27 @@ if cur_hash != st.session_state.last_save_hash:
         st.sidebar.error(f"Autosave failed: {e}")
 
 # ---------------------------------
-# Build table & alerts
+# Build table & compute alerts
 # ---------------------------------
 rows, failed, alert_items = [], [], []
 
 with st.spinner("Fetching intraday & daily…"):
     for sym in edited["Symbol"].dropna().astype(str):
         kind = asset_kind(sym)
+
+        # Intraday (for current price, EMA200, MACD on intraday)
         if kind == "crypto":
             df = fetch_intraday_crypto(sym, period="7d", interval="1m")
         else:
             df = fetch_intraday_general(sym, period="60d", interval="15m")
             if (df.empty or len(df) < 210) and sym in FALLBACK:
-                df = fetch_intraday_general(FALLBACK[sym], period="60d", interval="15m")
+                df_alt = fetch_intraday_general(FALLBACK[sym], period="60d", interval="15m")
+                if not df_alt.empty and len(df_alt) >= 210:
+                    df = df_alt
 
+        # Daily (for 2D/5D/7D % changes)
         df_daily = fetch_daily(sym, period="90d")
+
         if df.empty or "Close" not in df.columns:
             failed.append(sym)
             continue
@@ -232,7 +273,7 @@ with st.spinner("Fetching intraday & daily…"):
             if len(dclose) >= 8:
                 pct7 = (dclose.iloc[-1] / dclose.shift(7).iloc[-1] - 1.0) * 100.0
 
-        # Portfolio values
+        # User inputs
         row_user = edited[edited["Symbol"] == sym].iloc[0]
         qty    = row_user.get("Quantity", np.nan)
         buy    = row_user.get("Purchase Price", np.nan)
@@ -242,40 +283,42 @@ with st.spinner("Fetching intraday & daily…"):
 
         pl_pct = (last_price / float(buy) - 1.0) * 100.0 if pd.notna(buy) and buy != 0 else None
         pl_amt = (last_price - float(buy)) * float(qty) if pd.notna(buy) and pd.notna(qty) else None
+        dist_stop_pct = (last_price / float(stop) - 1.0) * 100.0 if pd.notna(stop) and stop != 0 else None
         below_stop = (last_price <= float(stop)) if pd.notna(stop) and stop != 0 else None
         above_target = (last_price >= float(target)) if pd.notna(target) and target != 0 else None
 
-        # Alerts
-        def push_alert(key: str, message: str):
-            if key not in st.session_state.sent_alerts:
-                st.session_state.sent_alerts.add(key)
+        # ---- Alert helper (12h throttle) ----
+        def push_alert(rule_key: str, message: str):
+            key = f"{sym}:{rule_key}"
+            if not alert_recent(key):
                 alert_items.append(message)
                 send_telegram(message)
+                record_alert(key)
 
-        # 1) P/L ±5% or ±10%
+        # 1) P/L from purchase ±10% / ±5%
         if pl_pct is not None:
-            if pl_pct >= 10: push_alert(f"{sym}:PL+10", f"🔔 {sym}: P/L +{pl_pct:.2f}% (≥10%)")
-            elif pl_pct <= -10: push_alert(f"{sym}:PL-10", f"🔔 {sym}: P/L {pl_pct:.2f}% (≤-10%)")
-            if 5 <= pl_pct < 10: push_alert(f"{sym}:PL+5", f"🔔 {sym}: P/L +{pl_pct:.2f}% (≥5%)")
-            elif -10 < pl_pct <= -5: push_alert(f"{sym}:PL-5", f"🔔 {sym}: P/L {pl_pct:.2f}% (≤-5%)")
+            if pl_pct >= 10:  push_alert("PL+10", f"🔔 {sym}: P/L +{pl_pct:.2f}% (≥10%)")
+            elif pl_pct <= -10: push_alert("PL-10", f"🔔 {sym}: P/L {pl_pct:.2f}% (≤-10%)")
+            if 5 <= pl_pct < 10:      push_alert("PL+5",  f"🔔 {sym}: P/L +{pl_pct:.2f}% (≥5%)")
+            elif -10 < pl_pct <= -5:  push_alert("PL-5",  f"🔔 {sym}: P/L {pl_pct:.2f}% (≤-5%)")
 
-        # 2) 2-day change ±3%
+        # 2) 2-day change ±3% (even without purchase)
         if pct2 is not None:
-            if pct2 >= 3: push_alert(f"{sym}:2D+3", f"📈 {sym}: +{pct2:.2f}% in 2 days")
-            elif pct2 <= -3: push_alert(f"{sym}:2D-3", f"📉 {sym}: {pct2:.2f}% in 2 days")
+            if pct2 >= 3:   push_alert("2D+3", f"📈 {sym}: +{pct2:.2f}% in 2 days (≥3%)")
+            elif pct2 <= -3: push_alert("2D-3", f"📉 {sym}: {pct2:.2f}% in 2 days (≤-3%)")
 
-        # 3) Stop level
+        # 3) Price ≤ Stop Level
         if below_stop is True:
-            push_alert(f"{sym}:STOP", f"⛔ {sym}: {last_price:.2f} ≤ Stop {float(stop):.2f}")
+            push_alert("STOP", f"⛔ {sym}: {last_price:.4f} ≤ Stop {float(stop):.4f}")
 
-        # 4) Target price
+        # 4) Price ≥ Target Price
         if above_target is True:
-            push_alert(f"{sym}:TARGET", f"🎯 {sym}: {last_price:.2f} ≥ Target {float(target):.2f}")
+            push_alert("TARGET", f"🎯 {sym}: {last_price:.4f} ≥ Target {float(target):.4f}")
 
-        # Symbol markers
+        # Symbol marker for quick scan
         symbol_label = sym
         if pl_pct is not None and pl_pct <= -5: symbol_label = "⛔ " + symbol_label
-        elif pct7 is not None and pct7 >= 3: symbol_label = "⬆️ " + symbol_label
+        elif pct7 is not None and pct7 >= 3:    symbol_label = "⬆️ " + symbol_label
 
         rows.append({
             "Symbol": symbol_label,
@@ -286,9 +329,6 @@ with st.spinner("Fetching intraday & daily…"):
             "7D %": None if pct7 is None else round(pct7, 2),
             "200 EMA (intraday)": round(float(ema200.iloc[-1]), 4),
             "Price vs 200 EMA": "Above" if last_price > float(ema200.iloc[-1]) else "Below",
-            "MACD": round(float(macd_val), 5),
-            "MACD Signal": round(float(macd_sig), 5),
-            "MACD Hist": round(float(macd_hist), 5),
             "MACD Crossover (intraday)": cross_state,
             "Quantity": None if pd.isna(qty) else float(qty),
             "Purchase Price": None if pd.isna(buy) else float(buy),
@@ -296,6 +336,7 @@ with st.spinner("Fetching intraday & daily…"):
             "Target Price": None if pd.isna(target) else float(target),
             "P/L %": None if pl_pct is None else round(pl_pct, 2),
             "P/L Amount": None if pl_amt is None else round(pl_amt, 2),
+            "Dist to Stop %": None if dist_stop_pct is None else round(dist_stop_pct, 2),
             "Below Stop?": below_stop if below_stop is not None else "",
             "Notes": notes,
         })
@@ -305,14 +346,15 @@ df_table = pd.DataFrame(rows)
 # ---------------------------------
 # Alerts panel
 # ---------------------------------
-st.subheader("🔔 Alerts")
+st.subheader("🔔 Alerts (12h throttle)")
 if alert_items:
-    for msg in alert_items: st.warning(msg)
+    for msg in alert_items:
+        st.warning(msg)
 else:
-    st.info("No new alerts this refresh.")
+    st.info("No new alerts this refresh (per-rule per-asset limited to once every 12 hours).")
 
 # ---------------------------------
-# Display table
+# Display & exports
 # ---------------------------------
 if not df_table.empty:
     st.subheader("Portfolio & Intraday Signals")
@@ -328,7 +370,11 @@ if not df_table.empty:
     c3.metric("Net P/L", f"{net_pl_amt:,.2f}")
     c4.metric("Net P/L %", f"{net_pl_pct:,.2f}%")
 
-    sort_col = st.selectbox("Sort by", ["Symbol","P/L %","P/L Amount","2D %","7D %","5D %","Price vs 200 EMA","MACD Crossover (intraday)","Target Price"], index=1)
+    sort_col = st.selectbox(
+        "Sort by",
+        ["Symbol","P/L %","P/L Amount","2D %","7D %","5D %","Price vs 200 EMA","Target Price"],
+        index=1
+    )
     ascending = st.checkbox("Ascending sort", value=False)
     if sort_col in df_table.columns:
         df_table = df_table.sort_values(by=sort_col, ascending=ascending, na_position="last")
@@ -336,7 +382,15 @@ if not df_table.empty:
     st.dataframe(df_table, use_container_width=True)
 
     persist_cols = ["Symbol","Quantity","Purchase Price","Stop Level","Target Price","Notes"]
-    st.download_button("Download Portfolio CSV", st.session_state.portfolio[persist_cols].to_csv(index=False).encode("utf-8"), file_name="portfolio.csv")
-    st.download_button("Download Full Report CSV", df_table.to_csv(index=False).encode("utf-8"), file_name="tracker_report.csv")
+    st.download_button(
+        "Download Portfolio CSV",
+        st.session_state.portfolio[persist_cols].to_csv(index=False).encode("utf-8"),
+        file_name="portfolio.csv"
+    )
+    st.download_button(
+        "Download Full Report CSV",
+        df_table.to_csv(index=False).encode("utf-8"),
+        file_name="tracker_report.csv"
+    )
 else:
     st.info("No rows to show yet. Add symbols or check inputs above.")
