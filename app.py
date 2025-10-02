@@ -53,6 +53,7 @@ THROTTLE_HOURS = 12
 
 def alert_recent(key):
     if alert_log.empty: return False
+    recent = alert_log[alert_log["key"]]==key
     recent = alert_log[alert_log["key"]==key]
     if recent.empty: return False
     return (datetime.now()-recent["timestamp"].max()) < timedelta(hours=THROTTLE_HOURS)
@@ -215,14 +216,22 @@ with st.spinner("Fetching data…"):
         if below_stop: push_alert("STOP",f"⛔ {sym}: {last_price:.2f} ≤ Stop {stop:.2f}")
         if above_target: push_alert("TARGET",f"🎯 {sym}: {last_price:.2f} ≥ Target {target:.2f}")
 
-        # Add explanation for highlight color
+        # ----- Signal (text) and highlight color selection -----
+        # Priority: P/L conditions (Green/Red) override Blue. If no purchase price, only Blue can trigger.
         signal_note = ""
-        if pd.notna(pl_pct) and pl_pct <= -5:
-            signal_note = "Loss >5% (Red)"
-        elif pd.notna(pl_pct) and pl_pct >= 10:
-            signal_note = "Gain >10% (Green)"
-        elif pd.notna(pct2) and pct2 >= 3:
-            signal_note = "2D +3% (Blue)"
+
+        if pd.notna(pl_pct):
+            if pl_pct <= -10:
+                signal_note = "Loss >10%"
+            elif pl_pct <= -5:
+                signal_note = "Loss >5%"
+            elif pl_pct >= 10:
+                signal_note = "Gain >10%"
+            elif pl_pct >= 5:
+                signal_note = "Gain >5%"
+
+        if signal_note == "" and pd.notna(pct2) and (abs(pct2) >= 3):
+            signal_note = "2D move >3%"
 
         rows.append({
             "Symbol":sym,
@@ -248,20 +257,24 @@ with st.spinner("Fetching data…"):
 
 df_table = pd.DataFrame(rows)
 
-# Reorder to ensure Signal is right after Symbol
+# Ensure Signal is right after Symbol
 if "Signal" in df_table.columns and "Symbol" in df_table.columns:
     cols = df_table.columns.tolist()
     cols.insert(cols.index("Symbol")+1, cols.pop(cols.index("Signal")))
     df_table = df_table[cols]
 
-# Highlight Symbol column
+# Highlight Symbol column using the *numeric* columns (not the string text),
+# with your latest rules: Red ≤ -5%, Green ≥ 5%, Blue if abs(2D%) ≥ 3
 def highlight_symbol(row):
+    red = pd.notna(row.get("P/L %")) and row["P/L %"] <= -5
+    green = pd.notna(row.get("P/L %")) and row["P/L %"] >= 5
+    blue = pd.notna(row.get("2D %")) and abs(row["2D %"]) >= 3
     color = ""
-    if pd.notna(row.get("P/L %")) and row["P/L %"] <= -5:
+    if red:
         color = "background-color: lightcoral"
-    elif pd.notna(row.get("P/L %")) and row["P/L %"] >= 10:
+    elif green:
         color = "background-color: lightgreen"
-    elif pd.notna(row.get("2D %")) and row["2D %"] >= 3:
+    elif blue:
         color = "background-color: lightblue"
     return [color if col=="Symbol" else "" for col in df_table.columns]
 
