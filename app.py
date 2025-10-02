@@ -1,6 +1,6 @@
 # ==============================================
 # UNIVERSAL TRACKER — EMA200 (3h) + MACD (daily trend) + Alerts (12h throttle)
-# with 15m/1m prices for refresh
+# Prices: 15m (stocks/metals/FX), 1m (crypto)
 # ==============================================
 
 import os
@@ -165,12 +165,16 @@ with st.spinner("Fetching data…"):
         sym = str(row["Symbol"]).strip()
         if not sym: continue
 
-        # EMA200 (3h)
+        # EMA200 (3h + fallback)
         ema200_val = ema200_3h(sym)
-        ema_state = "Above" if ema200_val and fetch_15m_price(sym) and fetch_15m_price(sym)>ema200_val else "Below" if ema200_val else "N/A"
 
         # Price from fast feed
         last_price = fetch_1m_price(sym) if is_crypto(sym) else fetch_15m_price(sym)
+
+        # Determine EMA state (using last_price)
+        ema_state = "N/A"
+        if ema200_val and last_price:
+            ema_state = "Above" if last_price > ema200_val else "Below"
 
         # MACD daily
         macd_state, macd_val, macd_sig, macd_hist = macd_trend_daily(sym)
@@ -184,6 +188,7 @@ with st.spinner("Fetching data…"):
             if len(close)>=6: pct5=(close.iloc[-1]/close.iloc[-6]-1)*100
             if len(close)>=8: pct7=(close.iloc[-1]/close.iloc[-8]-1)*100
 
+        # User fields
         qty,buy,stop,target,notes = row.get("Quantity",np.nan),row.get("Purchase Price",np.nan),\
                                     row.get("Stop Level",np.nan),row.get("Target Price",np.nan),row.get("Notes","")
         pl_pct = (last_price/buy-1)*100 if last_price and pd.notna(buy) and buy!=0 else None
@@ -192,6 +197,7 @@ with st.spinner("Fetching data…"):
         below_stop = last_price and pd.notna(stop) and stop>0 and last_price<=stop
         above_target = last_price and pd.notna(target) and target>0 and last_price>=target
 
+        # Alerts
         def push_alert(key,msg):
             if not alert_recent(f"{sym}:{key}"):
                 alerts.append(msg); send_telegram(msg); record_alert(f"{sym}:{key}")
@@ -210,13 +216,18 @@ with st.spinner("Fetching data…"):
         if above_target: push_alert("TARGET",f"🎯 {sym}: {last_price:.2f} ≥ Target {target:.2f}")
 
         rows.append({
-            "Symbol":sym,"Date/Time":datetime.now(),"Current Price":None if not last_price else round(last_price,4),
+            "Symbol":sym,"Date/Time":datetime.now(),
+            "Current Price":None if not last_price else round(last_price,4),
             "200 EMA (3h)":None if ema200_val is None else round(ema200_val,4),
             "Price vs 200 EMA (3h)":ema_state,
+            "MACD (daily)":round(macd_val,5),
+            "MACD Signal (daily)":round(macd_sig,5),
+            "MACD Hist (daily)":round(macd_hist,5),
             "MACD Trend (daily)":macd_state,
             "2D %":None if pct2 is None else round(pct2,2),
             "5D %":None if pct5 is None else round(pct5,2),
             "7D %":None if pct7 is None else round(pct7,2),
+            "Quantity":None if pd.isna(qty) else float(qty),
             "Purchase Price":None if pd.isna(buy) else float(buy),
             "Stop Level":None if pd.isna(stop) else float(stop),
             "Target Price":None if pd.isna(target) else float(target),
@@ -227,21 +238,29 @@ with st.spinner("Fetching data…"):
 
 df_table = pd.DataFrame(rows)
 
-# Alerts panel
+# ---------------------------------
+# Alerts Panel with Reset
+# ---------------------------------
 st.subheader("🔔 Alerts (12h throttle)")
-c1,c2=st.columns([3,1])
+c1,c2 = st.columns([3,1])
 with c1:
-    if alerts: [st.warning(m) for m in alerts]
-    else: st.info("No new alerts this refresh.")
+    if alerts:
+        for msg in alerts:
+            st.warning(msg)
+    else:
+        st.info("No new alerts this refresh.")
 with c2:
     if st.button("🔄 Reset Alerts"):
         if os.path.exists(ALERTS_LOG): os.remove(ALERTS_LOG)
         alert_log=pd.DataFrame(columns=["key","timestamp"])
         st.success("Alert history cleared ✅")
 
-# Display
+# ---------------------------------
+# Portfolio Display
+# ---------------------------------
 if not df_table.empty:
+    st.subheader("Portfolio & Signals")
     st.dataframe(df_table,use_container_width=True)
-    st.download_button("Download CSV",df_table.to_csv(index=False).encode("utf-8"),file_name="tracker.csv")
+    st.download_button("Download Full Report CSV", df_table.to_csv(index=False).encode("utf-8"), file_name="tracker_report.csv")
 else:
     st.info("No rows to show yet.")
