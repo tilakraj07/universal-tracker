@@ -1,9 +1,9 @@
-gspread
-gspread-dataframe
-google-auth
-streamlit-autorefresh
+streamlit
 yfinance
 pandas
 numpy
 requests
-streamlit
+streamlit-autorefresh
+gspread
+gspread-dataframe
+google-auth
