@@ -1,6 +1,6 @@
 # ==============================================
-# UNIVERSAL TRACKER — EMA200 (3h) + MACD (daily trend) + Alerts (12h throttle)
-# Prices: 15m (stocks/metals/FX), 1m (crypto)
+# UNIVERSAL TRACKER — EMA200 (3h) + MACD (daily) + Alerts (12h throttle)
+# Durable storage via Google Sheets (CSV fallback) + Save/Reload buttons
 # ==============================================
 
 import os
@@ -12,6 +12,11 @@ import requests
 from datetime import datetime, timedelta
 from streamlit_autorefresh import st_autorefresh
 
+# Google Sheets libs
+import gspread
+from gspread_dataframe import set_with_dataframe, get_as_dataframe
+from google.oauth2.service_account import Credentials
+
 st.set_page_config(page_title="Universal Tracker — Intraday + Alerts", layout="wide")
 st.title("📊 Universal Tracker — EMA200 (3h) + MACD (daily trend) + Alerts")
 
@@ -22,59 +27,191 @@ PORTFOLIO_CSV = "portfolio.csv"
 ALERTS_LOG = "alerts_log.csv"
 
 # ---------------------------------
-# Telegram setup (HARDCODED)
+# Telegram (hardcoded; optional)
 # ---------------------------------
 tg_enable = True
 tg_token  = "8298370446:AAHQJdZpq1TZumNG3tacLpBnH6Ge6cCJU3o"
 tg_chat   = "888880398"
 
 def send_telegram(msg: str):
-    if not (tg_enable and tg_token and tg_chat): 
+    if not (tg_enable and tg_token and tg_chat):
         return
     try:
         url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-        requests.post(url, json={"chat_id": tg_chat, "text": msg})
+        requests.post(url, json={"chat_id": tg_chat, "text": msg}, timeout=15)
     except Exception:
         pass
 
 # ---------------------------------
-# Alerts log persistence (12h throttle)
+# Google Sheets helpers (Sheets first, CSV fallback)
+# ---------------------------------
+_SHEETS_CLIENT = None
+
+def _get_sheets_client():
+    """Lazy-init Google Sheets client from st.secrets."""
+    global _SHEETS_CLIENT
+    if _SHEETS_CLIENT is not None:
+        return _SHEETS_CLIENT
+    try:
+        sa_info = st.secrets["gcp_service_account"]
+        # You can add Drive scope if you hit open_by_url issues
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            # "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        gc = gspread.authorize(creds)
+        _SHEETS_CLIENT = gc
+        return gc
+    except Exception:
+        return None
+
+def _open_ws(url: str):
+    gc = _get_sheets_client()
+    if not gc or not url:
+        return None
+    try:
+        sh = gc.open_by_url(url)
+        return sh.sheet1
+    except Exception:
+        return None
+
+def sheets_available():
+    try:
+        return (
+            "sheets" in st.secrets
+            and "portfolio_sheet_url" in st.secrets["sheets"]
+            and "alerts_sheet_url" in st.secrets["sheets"]
+            and _get_sheets_client() is not None
+        )
+    except Exception:
+        return False
+
+# ---------------------------------
+# Portfolio persistence (Sheets + CSV fallback)
+# ---------------------------------
+DEFAULT_SYMBOLS = [
+    "RELIANCE.NS","HDFCBANK.NS","TCS.NS",  # India
+    "BTC-USD","SOL-USD",                   # Crypto
+    "XAUUSD=X","XAGUSD=X"                  # Spot metals
+]
+
+def _ensure_portfolio_cols(df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["Symbol","Quantity","Purchase Price","Stop Level","Target Price","Notes"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = np.nan if c != "Notes" else ""
+    return df[cols]
+
+def load_portfolio():
+    if sheets_available():
+        ws = _open_ws(st.secrets["sheets"]["portfolio_sheet_url"])
+        if ws:
+            try:
+                df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
+                df = df.dropna(how="all")
+                if not df.empty:
+                    return _ensure_portfolio_cols(df)
+            except Exception:
+                pass
+    if os.path.exists(PORTFOLIO_CSV):
+        try:
+            df = pd.read_csv(PORTFOLIO_CSV)
+            return _ensure_portfolio_cols(df)
+        except Exception:
+            pass
+    return pd.DataFrame({
+        "Symbol": DEFAULT_SYMBOLS,
+        "Quantity": np.nan,
+        "Purchase Price": np.nan,
+        "Stop Level": np.nan,
+        "Target Price": np.nan,
+        "Notes": ""
+    })
+
+def save_portfolio(df: pd.DataFrame):
+    try:
+        df.to_csv(PORTFOLIO_CSV, index=False)
+    except Exception:
+        pass
+    if sheets_available():
+        ws = _open_ws(st.secrets["sheets"]["portfolio_sheet_url"])
+        if ws:
+            try:
+                ws.clear()
+                set_with_dataframe(ws, df)
+            except Exception:
+                pass
+
+# ---------------------------------
+# Alerts log persistence (Sheets + CSV fallback)
 # ---------------------------------
 def load_alert_log():
+    if sheets_available():
+        ws = _open_ws(st.secrets["sheets"]["alerts_sheet_url"])
+        if ws:
+            try:
+                df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
+                df = df.dropna(how="all")
+                if not df.empty:
+                    if "timestamp" in df.columns:
+                        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                    else:
+                        df["timestamp"] = pd.NaT
+                    if "key" not in df.columns:
+                        df["key"] = ""
+                    return df[["key","timestamp"]]
+            except Exception:
+                pass
     if os.path.exists(ALERTS_LOG):
         try:
             return pd.read_csv(ALERTS_LOG, parse_dates=["timestamp"])
-        except:
+        except Exception:
             pass
     return pd.DataFrame(columns=["key","timestamp"])
 
-def save_alert_log(df): 
+def save_alert_log(df: pd.DataFrame):
     try:
         df.to_csv(ALERTS_LOG, index=False)
-    except:
+    except Exception:
         pass
+    if sheets_available():
+        ws = _open_ws(st.secrets["sheets"]["alerts_sheet_url"])
+        if ws:
+            try:
+                ws.clear()
+                df2 = df.copy()
+                if "timestamp" in df2.columns:
+                    df2["timestamp"] = df2["timestamp"].astype(str)
+                set_with_dataframe(ws, df2)
+            except Exception:
+                pass
 
+# Initialize alerts log once
 alert_log = load_alert_log()
 THROTTLE_HOURS = 12
 
 def alert_recent(key):
     if alert_log.empty:
         return False
-    recent = alert_log[alert_log["key"] == key]   # ✅ fixed line
+    recent = alert_log[alert_log["key"] == key]
     if recent.empty:
         return False
-    return (datetime.now()-recent["timestamp"].max()) < timedelta(hours=THROTTLE_HOURS)
+    return (datetime.now() - recent["timestamp"].max()) < timedelta(hours=THROTTLE_HOURS)
 
 def record_alert(key):
     global alert_log
-    alert_log = pd.concat([alert_log, pd.DataFrame([{"key":key,"timestamp":datetime.now()}])], ignore_index=True)
+    alert_log = pd.concat(
+        [alert_log, pd.DataFrame([{"key": key, "timestamp": datetime.now()}])],
+        ignore_index=True
+    )
     save_alert_log(alert_log)
 
 # ---------------------------------
 # Data fetchers
 # ---------------------------------
 def ensure_cols(df):
-    if isinstance(df.columns,pd.MultiIndex):
+    if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
 
@@ -103,175 +240,182 @@ def fetch_1m_price(sym):
     df = yf.download(sym, period="2d", interval="1m", progress=False, auto_adjust=False)
     return float(df["Close"].iloc[-1]) if not df.empty else None
 
-def is_crypto(sym): 
+def is_crypto(sym):
     return str(sym).upper().endswith("-USD")
 
 # ---------------------------------
 # Indicators
 # ---------------------------------
-def ema(s, span): 
+def ema(s, span):
     return s.ewm(span=span, adjust=False).mean()
 
 def macd(series):
     ema12, ema26 = ema(series,12), ema(series,26)
-    macd_line = ema12-ema26
+    macd_line = ema12 - ema26
     signal = ema(macd_line,9)
-    hist = macd_line-signal
+    hist = macd_line - signal
     return macd_line, signal, hist
 
 def macd_trend_daily(sym):
     df = fetch_daily(sym)
-    if df.empty or "Close" not in df: 
-        return "None",0,0,0
+    if df.empty or "Close" not in df:
+        return "None", 0, 0, 0
     close = pd.to_numeric(df["Close"], errors="coerce").dropna()
-    if len(close)<30: 
-        return "None",0,0,0
+    if len(close) < 30:
+        return "None", 0, 0, 0
     macd_line, signal, hist = macd(close)
-    c,s,h = float(macd_line.iloc[-1]), float(signal.iloc[-1]), float(hist.iloc[-1])
-    return ("Bullish" if c>s else "Bearish" if c<s else "None"), c,s,h
+    c, s, h = float(macd_line.iloc[-1]), float(signal.iloc[-1]), float(hist.iloc[-1])
+    return ("Bullish" if c > s else "Bearish" if c < s else "None"), c, s, h
 
 def ema200_3h(sym):
     df3 = fetch_3h(sym)
-    if not df3.empty and len(df3)>=210:
+    if not df3.empty and len(df3) >= 210:
         close = pd.to_numeric(df3["Close"], errors="coerce").dropna()
-        return float(ema(close,200).iloc[-1])
+        return float(ema(close, 200).iloc[-1])
     # fallback: resample from 60m → 180m
     df60 = fetch_60m(sym)
     if not df60.empty:
         close = pd.to_numeric(df60["Close"], errors="coerce").dropna()
         s = pd.Series(close.values, index=pd.to_datetime(close.index))
         s3h = s.resample("180min").last().dropna()
-        if len(s3h)>=210:
-            return float(ema(s3h,200).iloc[-1])
+        if len(s3h) >= 210:
+            return float(ema(s3h, 200).iloc[-1])
     return None
 
 # ---------------------------------
-# Portfolio
+# Portfolio UI (Save/Reload; no auto-overwrite)
 # ---------------------------------
-DEFAULT_SYMBOLS = ["RELIANCE.NS","HDFCBANK.NS","TCS.NS","BTC-USD","XAUUSD=X"]
-
-def load_portfolio():
-    if os.path.exists(PORTFOLIO_CSV):
-        try: 
-            return pd.read_csv(PORTFOLIO_CSV)
-        except: 
-            pass
-    return pd.DataFrame({
-        "Symbol":DEFAULT_SYMBOLS,"Quantity":np.nan,"Purchase Price":np.nan,
-        "Stop Level":np.nan,"Target Price":np.nan,"Notes":""
-    })
+def _clean_portfolio(df: pd.DataFrame) -> pd.DataFrame:
+    clean = df.copy()
+    if "Symbol" not in clean.columns:
+        clean["Symbol"] = ""
+    clean["Symbol"] = clean["Symbol"].astype(str).str.strip()
+    clean = clean[clean["Symbol"] != ""]
+    clean = clean.drop_duplicates(subset=["Symbol"], keep="last").reset_index(drop=True)
+    return _ensure_portfolio_cols(clean)
 
 if "portfolio" not in st.session_state:
     st.session_state.portfolio = load_portfolio()
 
 st.subheader("Edit your portfolio")
-edited = st.data_editor(st.session_state.portfolio,num_rows="dynamic",use_container_width=True)
-st.session_state.portfolio = edited.copy()
-st.session_state.portfolio.to_csv(PORTFOLIO_CSV,index=False)
+edited = st.data_editor(
+    st.session_state.portfolio,
+    num_rows="dynamic",
+    use_container_width=True,
+    key="portfolio_editor",
+)
+
+c_save, c_reload = st.columns([1,1])
+with c_save:
+    if st.button("💾 Save portfolio", use_container_width=True):
+        clean = _clean_portfolio(edited)
+        st.session_state.portfolio = clean
+        save_portfolio(clean)
+        st.success("Portfolio saved ✅")
+        st.experimental_rerun()
+
+with c_reload:
+    if st.button("🔁 Reload from storage", use_container_width=True):
+        st.session_state.portfolio = load_portfolio()
+        st.experimental_rerun()
 
 # ---------------------------------
-# Main Loop
+# Main data build
 # ---------------------------------
 rows, alerts = [], []
 
 with st.spinner("Fetching data…"):
-    for _,row in edited.iterrows():
+    for _, row in st.session_state.portfolio.iterrows():
         sym = str(row["Symbol"]).strip()
-        if not sym: continue
+        if not sym:
+            continue
 
-        # EMA200 (3h + fallback)
         ema200_val = ema200_3h(sym)
-
-        # Price from fast feed
         last_price = fetch_1m_price(sym) if is_crypto(sym) else fetch_15m_price(sym)
 
-        # Determine EMA state
         ema_state = "N/A"
-        if ema200_val and last_price:
+        if (ema200_val is not None) and (last_price is not None):
             ema_state = "Above" if last_price > ema200_val else "Below"
 
-        # MACD daily
         macd_state, macd_val, macd_sig, macd_hist = macd_trend_daily(sym)
 
-        # Daily % changes
         df_daily = fetch_daily(sym, period="90d")
-        pct2=pct5=pct7=None
+        pct2 = pct5 = pct7 = None
         if not df_daily.empty:
-            close = pd.to_numeric(df_daily["Close"],errors="coerce").dropna()
-            if len(close)>=3: pct2=(close.iloc[-1]/close.iloc[-3]-1)*100
-            if len(close)>=6: pct5=(close.iloc[-1]/close.iloc[-6]-1)*100
-            if len(close)>=8: pct7=(close.iloc[-1]/close.iloc[-8]-1)*100
+            close = pd.to_numeric(df_daily["Close"], errors="coerce").dropna()
+            if len(close) >= 3: pct2 = (close.iloc[-1] / close.iloc[-3] - 1) * 100
+            if len(close) >= 6: pct5 = (close.iloc[-1] / close.iloc[-6] - 1) * 100
+            if len(close) >= 8: pct7 = (close.iloc[-1] / close.iloc[-8] - 1) * 100
 
-        # User fields
-        qty,buy,stop,target,notes = row.get("Quantity",np.nan),row.get("Purchase Price",np.nan),\
-                                    row.get("Stop Level",np.nan),row.get("Target Price",np.nan),row.get("Notes","")
-        pl_pct = (last_price/buy-1)*100 if last_price and pd.notna(buy) and buy!=0 else None
-        pl_amt = (last_price-buy)*qty if last_price and pd.notna(buy) and pd.notna(qty) else None
+        qty   = row.get("Quantity", np.nan)
+        buy   = row.get("Purchase Price", np.nan)
+        stop  = row.get("Stop Level", np.nan)
+        target= row.get("Target Price", np.nan)
+        notes = row.get("Notes", "")
 
-        below_stop = last_price and pd.notna(stop) and stop>0 and last_price<=stop
-        above_target = last_price and pd.notna(target) and target>0 and last_price>=target
+        pl_pct = (last_price / buy - 1) * 100 if (last_price is not None and pd.notna(buy) and buy != 0) else None
+        pl_amt = (last_price - buy) * qty if (last_price is not None and pd.notna(buy) and pd.notna(qty)) else None
 
-        # Alerts
-        def push_alert(key,msg):
+        below_stop  = (last_price is not None) and pd.notna(stop) and stop > 0 and last_price <= stop
+        above_target= (last_price is not None) and pd.notna(target) and target > 0 and last_price >= target
+
+        def push_alert(key, msg):
             if not alert_recent(f"{sym}:{key}"):
-                alerts.append(msg); send_telegram(msg); record_alert(f"{sym}:{key}")
+                alerts.append(msg)
+                send_telegram(msg)
+                record_alert(f"{sym}:{key}")
 
         if pl_pct is not None:
-            if pl_pct>=10: push_alert("PL+10",f"🔔 {sym}: P/L +{pl_pct:.2f}%")
-            elif pl_pct<=-10: push_alert("PL-10",f"🔔 {sym}: P/L {pl_pct:.2f}%")
-            if 5<=pl_pct<10: push_alert("PL+5",f"🔔 {sym}: P/L +{pl_pct:.2f}%")
-            elif -10<pl_pct<=-5: push_alert("PL-5",f"🔔 {sym}: P/L {pl_pct:.2f}%")
+            if pl_pct >= 10: push_alert("PL+10", f"🔔 {sym}: P/L +{pl_pct:.2f}%")
+            elif pl_pct <= -10: push_alert("PL-10", f"🔔 {sym}: P/L {pl_pct:.2f}%")
+            if 5 <= pl_pct < 10: push_alert("PL+5", f"🔔 {sym}: P/L +{pl_pct:.2f}%")
+            elif -10 < pl_pct <= -5: push_alert("PL-5", f"🔔 {sym}: P/L {pl_pct:.2f}%")
 
         if pct2 is not None:
-            if pct2>=3: push_alert("2D+3",f"📈 {sym}: +{pct2:.2f}% in 2 days")
-            elif pct2<=-3: push_alert("2D-3",f"📉 {sym}: {pct2:.2f}% in 2 days")
+            if pct2 >= 3: push_alert("2D+3", f"📈 {sym}: +{pct2:.2f}% in 2 days")
+            elif pct2 <= -3: push_alert("2D-3", f"📉 {sym}: {pct2:.2f}% in 2 days")
 
-        if below_stop: push_alert("STOP",f"⛔ {sym}: {last_price:.2f} ≤ Stop {stop:.2f}")
-        if above_target: push_alert("TARGET",f"🎯 {sym}: {last_price:.2f} ≥ Target {target:.2f}")
+        if below_stop:   push_alert("STOP",   f"⛔ {sym}: {last_price:.2f} ≤ Stop {float(stop):.2f}")
+        if above_target: push_alert("TARGET", f"🎯 {sym}: {last_price:.2f} ≥ Target {float(target):.2f}")
 
-        # ----- Signal Logic -----
         signal_note = ""
         if pd.notna(pl_pct):
-            if pl_pct <= -10:
-                signal_note = "Loss >10%"
-            elif pl_pct <= -5:
-                signal_note = "Loss >5%"
-            elif pl_pct >= 10:
-                signal_note = "Gain >10%"
-            elif pl_pct >= 5:
-                signal_note = "Gain >5%"
+            if pl_pct <= -10: signal_note = "Loss >10%"
+            elif pl_pct <= -5: signal_note = "Loss >5%"
+            elif pl_pct >= 10: signal_note = "Gain >10%"
+            elif pl_pct >= 5:  signal_note = "Gain >5%"
 
         if signal_note == "" and pd.notna(pct2) and (abs(pct2) >= 3):
             signal_note = "2D move >3%"
 
         rows.append({
-            "Symbol":sym,
-            "Signal":signal_note,
-            "2D %":None if pct2 is None else round(pct2,2),
-            "5D %":None if pct5 is None else round(pct5,2),
-            "7D %":None if pct7 is None else round(pct7,2),
-            "Current Price":None if not last_price else round(last_price,2),
-            "200 EMA (3h)":None if ema200_val is None else round(ema200_val,2),
-            "Price vs 200 EMA (3h)":ema_state,
-            "MACD (daily)":round(macd_val,2),
-            "MACD Signal (daily)":round(macd_sig,2),
-            "MACD Hist (daily)":round(macd_hist,2),
-            "MACD Trend (daily)":macd_state,
-            "Quantity":None if pd.isna(qty) else round(float(qty),2),
-            "Purchase Price":None if pd.isna(buy) else round(float(buy),2),
-            "Stop Level":None if pd.isna(stop) else round(float(stop),2),
-            "Target Price":None if pd.isna(target) else round(float(target),2),
-            "P/L %":None if pl_pct is None else round(pl_pct,2),
-            "P/L Amount":None if pl_amt is None else round(pl_amt,2),
-            "Notes":notes
+            "Symbol": sym,
+            "Signal": signal_note,
+            "2D %": None if pct2 is None else round(pct2, 2),
+            "5D %": None if pct5 is None else round(pct5, 2),
+            "7D %": None if pct7 is None else round(pct7, 2),
+            "Current Price": None if last_price is None else round(last_price, 2),
+            "200 EMA (3h)": None if ema200_val is None else round(ema200_val, 2),
+            "Price vs 200 EMA (3h)": ema_state,
+            "MACD (daily)": round(macd_val, 2),
+            "MACD Signal (daily)": round(macd_sig, 2),
+            "MACD Hist (daily)": round(macd_hist, 2),
+            "MACD Trend (daily)": macd_state,
+            "Quantity": None if pd.isna(qty) else round(float(qty), 2),
+            "Purchase Price": None if pd.isna(buy) else round(float(buy), 2),
+            "Stop Level": None if pd.isna(stop) else round(float(stop), 2),
+            "Target Price": None if pd.isna(target) else round(float(target), 2),
+            "P/L %": None if pl_pct is None else round(pl_pct, 2),
+            "P/L Amount": None if pl_amt is None else round(pl_amt, 2),
+            "Notes": notes
         })
 
 df_table = pd.DataFrame(rows)
 
 # Ensure Signal column is right after Symbol
-if "Signal" in df_table.columns and "Symbol" in df_table.columns:
+if not df_table.empty and "Signal" in df_table.columns and "Symbol" in df_table.columns:
     cols = df_table.columns.tolist()
-    cols.insert(cols.index("Symbol")+1, cols.pop(cols.index("Signal")))
+    cols.insert(cols.index("Symbol") + 1, cols.pop(cols.index("Signal")))
     df_table = df_table[cols]
 
 # Highlight Symbol column
@@ -280,29 +424,19 @@ def highlight_symbol(row):
     green = pd.notna(row.get("P/L %")) and row["P/L %"] >= 5
     blue = pd.notna(row.get("2D %")) and abs(row["2D %"]) >= 3
     color = ""
-    if red:
-        color = "background-color: lightcoral"
-    elif green:
-        color = "background-color: lightgreen"
-    elif blue:
-        color = "background-color: lightblue"
-    return [color if col=="Symbol" else "" for col in df_table.columns]
+    if red: color = "background-color: lightcoral"
+    elif green: color = "background-color: lightgreen"
+    elif blue: color = "background-color: lightblue"
+    return [color if col == "Symbol" else "" for col in df_table.columns]
 
-# Format with % signs
-format_dict = {
-    "2D %": "{:.2f}%",
-    "5D %": "{:.2f}%",
-    "7D %": "{:.2f}%",
-    "P/L %": "{:.2f}%"
-}
-
+format_dict = {"2D %": "{:.2f}%", "5D %": "{:.2f}%", "7D %": "{:.2f}%", "P/L %": "{:.2f}%"}
 styled_table = df_table.style.apply(highlight_symbol, axis=1).format(format_dict).format(precision=2)
 
 # ---------------------------------
-# Alerts Panel with Reset
+# Alerts Panel with Reset (clears Sheets + CSV)
 # ---------------------------------
 st.subheader("🔔 Alerts (12h throttle)")
-c1,c2 = st.columns([3,1])
+c1, c2 = st.columns([3, 1])
 with c1:
     if alerts:
         for msg in alerts:
@@ -311,8 +445,15 @@ with c1:
         st.info("No new alerts this refresh.")
 with c2:
     if st.button("🔄 Reset Alerts"):
-        if os.path.exists(ALERTS_LOG): os.remove(ALERTS_LOG)
-        alert_log=pd.DataFrame(columns=["key","timestamp"])
+        empty_df = pd.DataFrame(columns=["key","timestamp"])
+        try:
+            if os.path.exists(ALERTS_LOG):
+                os.remove(ALERTS_LOG)
+        except Exception:
+            pass
+        save_alert_log(empty_df)
+        # reset in-memory
+        alert_log = empty_df
         st.success("Alert history cleared ✅")
 
 # ---------------------------------
@@ -320,7 +461,35 @@ with c2:
 # ---------------------------------
 if not df_table.empty:
     st.subheader("Portfolio & Signals")
-    st.dataframe(styled_table,use_container_width=True)
-    st.download_button("Download Full Report CSV", df_table.to_csv(index=False).encode("utf-8"), file_name="tracker_report.csv")
+    st.dataframe(styled_table, use_container_width=True)
+    st.download_button(
+        "Download Full Report CSV",
+        df_table.to_csv(index=False).encode("utf-8"),
+        file_name="tracker_report.csv"
+    )
 else:
     st.info("No rows to show yet.")
+
+# ---------------------------------
+# (Optional) Quick connection check panel
+# ---------------------------------
+with st.expander("🔎 Google Sheets connection check", expanded=False):
+    try:
+        sa = st.secrets["gcp_service_account"]
+        st.write("✓ Secrets loaded")
+        st.write("Service account:", sa.get("client_email", "N/A"))
+    except Exception as e:
+        st.error(f"Secrets not loaded: {e}")
+
+    try:
+        creds = Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_url(st.secrets["sheets"]["portfolio_sheet_url"])
+        st.success(f"✓ Can open Portfolio sheet: {sh.title}")
+        sh2 = gc.open_by_url(st.secrets["sheets"]["alerts_sheet_url"])
+        st.success(f"✓ Can open Alerts sheet: {sh2.title}")
+    except Exception as e:
+        st.error(f"Sheets error: {e}")
