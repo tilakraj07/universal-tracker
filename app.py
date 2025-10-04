@@ -43,6 +43,15 @@ def send_telegram(msg: str):
         pass
 
 # ---------------------------------
+# Rerun helper (works on all Streamlit versions)
+# ---------------------------------
+def _safe_rerun():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
+
+# ---------------------------------
 # Google Sheets helpers (Sheets first, CSV fallback)
 # ---------------------------------
 _SHEETS_CLIENT = None
@@ -54,9 +63,9 @@ def _get_sheets_client():
         return _SHEETS_CLIENT
     try:
         sa_info = st.secrets["gcp_service_account"]
-        # You can add Drive scope if you hit open_by_url issues
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
+            # If open_by_url fails, uncomment Drive scope below and enable Drive API in GCP:
             # "https://www.googleapis.com/auth/drive",
         ]
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
@@ -312,12 +321,12 @@ with c_save:
         st.session_state.portfolio = clean
         save_portfolio(clean)
         st.success("Portfolio saved ✅")
-        st.experimental_rerun()
+        _safe_rerun()
 
 with c_reload:
     if st.button("🔁 Reload from storage", use_container_width=True):
         st.session_state.portfolio = load_portfolio()
-        st.experimental_rerun()
+        _safe_rerun()
 
 # ---------------------------------
 # Main data build
@@ -347,17 +356,17 @@ with st.spinner("Fetching data…"):
             if len(close) >= 6: pct5 = (close.iloc[-1] / close.iloc[-6] - 1) * 100
             if len(close) >= 8: pct7 = (close.iloc[-1] / close.iloc[-8] - 1) * 100
 
-        qty   = row.get("Quantity", np.nan)
-        buy   = row.get("Purchase Price", np.nan)
-        stop  = row.get("Stop Level", np.nan)
-        target= row.get("Target Price", np.nan)
-        notes = row.get("Notes", "")
+        qty    = row.get("Quantity", np.nan)
+        buy    = row.get("Purchase Price", np.nan)
+        stop   = row.get("Stop Level", np.nan)
+        target = row.get("Target Price", np.nan)
+        notes  = row.get("Notes", "")
 
         pl_pct = (last_price / buy - 1) * 100 if (last_price is not None and pd.notna(buy) and buy != 0) else None
         pl_amt = (last_price - buy) * qty if (last_price is not None and pd.notna(buy) and pd.notna(qty)) else None
 
-        below_stop  = (last_price is not None) and pd.notna(stop) and stop > 0 and last_price <= stop
-        above_target= (last_price is not None) and pd.notna(target) and target > 0 and last_price >= target
+        below_stop   = (last_price is not None) and pd.notna(stop) and stop > 0 and last_price <= stop
+        above_target = (last_price is not None) and pd.notna(target) and target > 0 and last_price >= target
 
         def push_alert(key, msg):
             if not alert_recent(f"{sym}:{key}"):
