@@ -446,31 +446,36 @@ with st.spinner("Fetching data…"):
 
 df_table = pd.DataFrame(rows)
 
-# ======= Header Summary (Overall) =======
+# ======= Header Summary (Overall — only count rows with Purchase Price) =======
 def _num(x):
     try: return float(x)
     except: return np.nan
 
 if not df_table.empty:
+    # Work on a copy, coerce numerics
     df_sum = df_table.copy()
-    # numeric coercions
     for c in ["Quantity","Purchase Price","Current Price","Invested Amount"]:
         if c in df_sum.columns:
             df_sum[c] = df_sum[c].apply(_num)
 
-    # compute totals
-    if "Invested Amount" not in df_sum.columns:
-        df_sum["Invested Amount"] = df_sum["Quantity"] * df_sum["Purchase Price"]
-    df_sum["Current Value"] = df_sum["Quantity"] * df_sum["Current Price"]
+    # Keep only positions where a Purchase Price is provided and Quantity > 0
+    mask_positions = df_sum["Purchase Price"].notna() & df_sum["Quantity"].notna() & (df_sum["Quantity"] > 0)
+    df_pos = df_sum.loc[mask_positions].copy()
 
-    total_invested = float(np.nansum(df_sum["Invested Amount"]))
-    total_current  = float(np.nansum(df_sum["Current Value"]))
+    # Compute invested/current values for these positions only
+    if "Invested Amount" not in df_pos.columns:
+        df_pos["Invested Amount"] = df_pos["Quantity"] * df_pos["Purchase Price"]
+    df_pos["Current Value"] = df_pos["Quantity"] * df_pos["Current Price"]
+
+    # Totals (only purchased positions)
+    total_invested = float(np.nansum(df_pos["Invested Amount"])) if not df_pos.empty else 0.0
+    total_current  = float(np.nansum(df_pos["Current Value"])) if not df_pos.empty else 0.0
     overall_ret_pct = (total_current/total_invested - 1) * 100 if total_invested > 0 else 0.0
 
-    # daily portfolio value change %
+    # Daily portfolio value change % (position-weighted, only purchased positions)
     daily_prev_total = 0.0
     daily_curr_total = 0.0
-    for _, r in df_sum.iterrows():
+    for _, r in df_pos.iterrows():
         q = _num(r.get("Quantity"))
         sym = str(r.get("Symbol", "")).strip()
         if pd.isna(q) or q is None or q == 0 or not sym:
@@ -487,15 +492,12 @@ if not df_table.empty:
                 curr = float(closes.iloc[-1])
                 daily_prev_total += q * curr
                 daily_curr_total += q * curr
-    if daily_prev_total > 0:
-        daily_change_pct = (daily_curr_total / daily_prev_total - 1) * 100
-    else:
-        daily_change_pct = 0.0
+    daily_change_pct = (daily_curr_total / daily_prev_total - 1) * 100 if daily_prev_total > 0 else 0.0
 
-    # Top 3 holdings (%) by current value
+    # Top 3 holdings (%) among purchased positions
     top3_share_pct = 0.0
-    if total_current > 0:
-        weights = (df_sum.assign(weight=lambda d: d["Current Value"]/total_current * 100)
+    if total_current > 0 and not df_pos.empty:
+        weights = (df_pos.assign(weight=lambda d: d["Current Value"]/total_current * 100)
                         .sort_values("weight", ascending=False)["weight"])
         top3_share_pct = float(weights.head(3).sum())
 
