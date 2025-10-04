@@ -370,6 +370,7 @@ with st.spinner("Fetching data…"):
         if (ema200_val is not None) and (last_price is not None):
             ema_state = "Above" if last_price > ema200_val else "Below"
 
+        # compute MACD trend ONLY (do not expose numeric MACD columns in UI)
         macd_state, macd_val, macd_sig, macd_hist = macd_trend_daily(sym)
 
         df_daily = fetch_daily(sym, period="90d")
@@ -388,6 +389,7 @@ with st.spinner("Fetching data…"):
 
         pl_pct = (last_price / buy - 1) * 100 if (last_price is not None and pd.notna(buy) and buy != 0) else None
         pl_amt = (last_price - buy) * qty if (last_price is not None and pd.notna(buy) and pd.notna(qty)) else None
+        invested_amt = (qty * buy) if (pd.notna(qty) and pd.notna(buy)) else None  # NEW: Invested Amount
 
         below_stop   = (last_price is not None) and pd.notna(stop) and stop > 0 and last_price <= stop
         above_target = (last_price is not None) and pd.notna(target) and target > 0 and last_price >= target
@@ -421,34 +423,98 @@ with st.spinner("Fetching data…"):
         if signal_note == "" and pd.notna(pct2) and (abs(pct2) >= 3):
             signal_note = "2D move >3%"
 
+        # NOTE: Removed MACD numeric columns from UI; kept MACD Trend.
         rows.append({
             "Symbol": sym,
             "Signal": signal_note,
+            "P/L %": None if pl_pct is None else round(pl_pct, 2),  # moved next to Signal in UI (reordered later)
             "2D %": None if pct2 is None else round(pct2, 2),
             "5D %": None if pct5 is None else round(pct5, 2),
             "7D %": None if pct7 is None else round(pct7, 2),
             "Current Price": None if last_price is None else round(last_price, 2),
             "200 EMA (3h)": None if ema200_val is None else round(ema200_val, 2),
             "Price vs 200 EMA (3h)": ema_state,
-            "MACD (daily)": round(macd_val, 2),
-            "MACD Signal (daily)": round(macd_sig, 2),
-            "MACD Hist (daily)": round(macd_hist, 2),
             "MACD Trend (daily)": macd_state,
+            "Invested Amount": None if invested_amt is None else round(float(invested_amt), 2),  # NEW position column
             "Quantity": None if pd.isna(qty) else round(float(qty), 2),
             "Purchase Price": None if pd.isna(buy) else round(float(buy), 2),
             "Stop Level": None if pd.isna(stop) else round(float(stop), 2),
             "Target Price": None if pd.isna(target) else round(float(target), 2),
-            "P/L %": None if pl_pct is None else round(pl_pct, 2),
             "P/L Amount": None if pl_amt is None else round(pl_amt, 2),
             "Notes": notes
         })
 
 df_table = pd.DataFrame(rows)
 
-# Ensure Signal column is right after Symbol
-if not df_table.empty and "Signal" in df_table.columns and "Symbol" in df_table.columns:
+# ======= Header Summary (Overall) =======
+def _num(x):
+    try: return float(x)
+    except: return np.nan
+
+if not df_table.empty:
+    df_sum = df_table.copy()
+    # numeric coercions
+    for c in ["Quantity","Purchase Price","Current Price","Invested Amount"]:
+        if c in df_sum.columns:
+            df_sum[c] = df_sum[c].apply(_num)
+
+    # compute totals
+    if "Invested Amount" not in df_sum.columns:
+        df_sum["Invested Amount"] = df_sum["Quantity"] * df_sum["Purchase Price"]
+    df_sum["Current Value"] = df_sum["Quantity"] * df_sum["Current Price"]
+
+    total_invested = float(np.nansum(df_sum["Invested Amount"]))
+    total_current  = float(np.nansum(df_sum["Current Value"]))
+    overall_ret_pct = (total_current/total_invested - 1) * 100 if total_invested > 0 else 0.0
+
+    # daily portfolio value change %
+    daily_prev_total = 0.0
+    daily_curr_total = 0.0
+    for _, r in df_sum.iterrows():
+        q = _num(r.get("Quantity"))
+        sym = str(r.get("Symbol", "")).strip()
+        if pd.isna(q) or q is None or q == 0 or not sym:
+            continue
+        dfd = fetch_daily(sym, period="10d")
+        if not dfd.empty and "Close" in dfd:
+            closes = pd.to_numeric(dfd["Close"], errors="coerce").dropna()
+            if len(closes) >= 2:
+                prev = float(closes.iloc[-2])
+                curr = float(closes.iloc[-1])
+                daily_prev_total += q * prev
+                daily_curr_total += q * curr
+            elif len(closes) == 1:
+                curr = float(closes.iloc[-1])
+                daily_prev_total += q * curr
+                daily_curr_total += q * curr
+    if daily_prev_total > 0:
+        daily_change_pct = (daily_curr_total / daily_prev_total - 1) * 100
+    else:
+        daily_change_pct = 0.0
+
+    # Top 3 holdings (%) by current value
+    top3_share_pct = 0.0
+    if total_current > 0:
+        weights = (df_sum.assign(weight=lambda d: d["Current Value"]/total_current * 100)
+                        .sort_values("weight", ascending=False)["weight"])
+        top3_share_pct = float(weights.head(3).sum())
+
+    # Render header metrics
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Overall Portfolio Value", f"{total_current:,.2f}")
+    m2.metric("Overall % (Invested vs Current)", f"{overall_ret_pct:+.2f}%")
+    m3.metric("Daily Portfolio Change", f"{daily_change_pct:+.2f}%")
+    m4.metric("Top 3 Holdings (share)", f"{top3_share_pct:.2f}%")
+
+# Ensure Signal & P/L % placement:
+# - Signal immediately after Symbol (already handled)
+# - P/L % right after Signal
+if not df_table.empty and "Signal" in df_table.columns and "Symbol" in df_table.columns and "P/L %" in df_table.columns:
     cols = df_table.columns.tolist()
+    # move Signal next to Symbol (keep existing behavior)
     cols.insert(cols.index("Symbol") + 1, cols.pop(cols.index("Signal")))
+    # move P/L % right after Signal
+    cols.insert(cols.index("Symbol") + 2, cols.pop(cols.index("P/L %")))
     df_table = df_table[cols]
 
 # Highlight Symbol column
