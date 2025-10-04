@@ -1,6 +1,7 @@
 # ==============================================
 # UNIVERSAL TRACKER — EMA200 (3h) + MACD (daily) + Alerts (12h throttle)
 # Durable storage via Google Sheets (CSV fallback) + Save/Reload buttons
+# NOW with cached Google Sheets reads to avoid 429 rate limits
 # ==============================================
 
 import os
@@ -20,7 +21,7 @@ from google.oauth2.service_account import Credentials
 st.set_page_config(page_title="Universal Tracker — Intraday + Alerts", layout="wide")
 st.title("📊 Universal Tracker — EMA200 (3h) + MACD (daily trend) + Alerts")
 
-# Auto-refresh every 15 minutes
+# Auto-refresh (15 min). If you still hit 429, consider 30 min: 1_800_000
 st_autorefresh(interval=900_000, key="auto15min")
 
 PORTFOLIO_CSV = "portfolio.csv"
@@ -97,6 +98,27 @@ def sheets_available():
         return False
 
 # ---------------------------------
+# Cached reads from Google Sheets (to avoid 429 rate limits)
+# ---------------------------------
+CACHE_TTL_SHEETS = 300  # 5 minutes
+
+@st.cache_data(ttl=CACHE_TTL_SHEETS, show_spinner=False)
+def _read_portfolio_from_sheets(url: str):
+    ws = _open_ws(url)
+    if not ws:
+        return pd.DataFrame()
+    df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
+    return df.dropna(how="all")
+
+@st.cache_data(ttl=CACHE_TTL_SHEETS, show_spinner=False)
+def _read_alerts_from_sheets(url: str):
+    ws = _open_ws(url)
+    if not ws:
+        return pd.DataFrame(columns=["key", "timestamp"])
+    df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
+    return df.dropna(how="all")
+
+# ---------------------------------
 # Portfolio persistence (Sheets + CSV fallback)
 # ---------------------------------
 DEFAULT_SYMBOLS = [
@@ -114,15 +136,12 @@ def _ensure_portfolio_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_portfolio():
     if sheets_available():
-        ws = _open_ws(st.secrets["sheets"]["portfolio_sheet_url"])
-        if ws:
-            try:
-                df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
-                df = df.dropna(how="all")
-                if not df.empty:
-                    return _ensure_portfolio_cols(df)
-            except Exception:
-                pass
+        try:
+            df = _read_portfolio_from_sheets(st.secrets["sheets"]["portfolio_sheet_url"])
+            if not df.empty:
+                return _ensure_portfolio_cols(df)
+        except Exception:
+            pass
     if os.path.exists(PORTFOLIO_CSV):
         try:
             df = pd.read_csv(PORTFOLIO_CSV)
@@ -139,16 +158,20 @@ def load_portfolio():
     })
 
 def save_portfolio(df: pd.DataFrame):
+    # Always save CSV as local fallback
     try:
         df.to_csv(PORTFOLIO_CSV, index=False)
     except Exception:
         pass
+    # Write to Sheets
     if sheets_available():
         ws = _open_ws(st.secrets["sheets"]["portfolio_sheet_url"])
         if ws:
             try:
                 ws.clear()
                 set_with_dataframe(ws, df)
+                # Bust the read cache so next read gets fresh data
+                _read_portfolio_from_sheets.clear()
             except Exception:
                 pass
 
@@ -157,21 +180,18 @@ def save_portfolio(df: pd.DataFrame):
 # ---------------------------------
 def load_alert_log():
     if sheets_available():
-        ws = _open_ws(st.secrets["sheets"]["alerts_sheet_url"])
-        if ws:
-            try:
-                df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
-                df = df.dropna(how="all")
-                if not df.empty:
-                    if "timestamp" in df.columns:
-                        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-                    else:
-                        df["timestamp"] = pd.NaT
-                    if "key" not in df.columns:
-                        df["key"] = ""
-                    return df[["key","timestamp"]]
-            except Exception:
-                pass
+        try:
+            df = _read_alerts_from_sheets(st.secrets["sheets"]["alerts_sheet_url"])
+            if not df.empty:
+                if "timestamp" in df.columns:
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                else:
+                    df["timestamp"] = pd.NaT
+                if "key" not in df.columns:
+                    df["key"] = ""
+                return df[["key","timestamp"]]
+        except Exception:
+            pass
     if os.path.exists(ALERTS_LOG):
         try:
             return pd.read_csv(ALERTS_LOG, parse_dates=["timestamp"])
@@ -193,6 +213,7 @@ def save_alert_log(df: pd.DataFrame):
                 if "timestamp" in df2.columns:
                     df2["timestamp"] = df2["timestamp"].astype(str)
                 set_with_dataframe(ws, df2)
+                _read_alerts_from_sheets.clear()
             except Exception:
                 pass
 
@@ -325,6 +346,9 @@ with c_save:
 
 with c_reload:
     if st.button("🔁 Reload from storage", use_container_width=True):
+        # Clear only the Sheets read caches; next load will refetch once
+        _read_portfolio_from_sheets.clear()
+        _read_alerts_from_sheets.clear()
         st.session_state.portfolio = load_portfolio()
         _safe_rerun()
 
@@ -480,25 +504,28 @@ else:
     st.info("No rows to show yet.")
 
 # ---------------------------------
-# (Optional) Quick connection check panel
+# Google Sheets connection check (only runs on click to save quota)
 # ---------------------------------
 with st.expander("🔎 Google Sheets connection check", expanded=False):
-    try:
-        sa = st.secrets["gcp_service_account"]
-        st.write("✓ Secrets loaded")
-        st.write("Service account:", sa.get("client_email", "N/A"))
-    except Exception as e:
-        st.error(f"Secrets not loaded: {e}")
+    if st.button("Run check"):
+        try:
+            sa = st.secrets["gcp_service_account"]
+            st.write("✓ Secrets loaded")
+            st.write("Service account:", sa.get("client_email", "N/A"))
+        except Exception as e:
+            st.error(f"Secrets not loaded: {e}")
 
-    try:
-        creds = Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"],
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_url(st.secrets["sheets"]["portfolio_sheet_url"])
-        st.success(f"✓ Can open Portfolio sheet: {sh.title}")
-        sh2 = gc.open_by_url(st.secrets["sheets"]["alerts_sheet_url"])
-        st.success(f"✓ Can open Alerts sheet: {sh2.title}")
-    except Exception as e:
-        st.error(f"Sheets error: {e}")
+        try:
+            creds = Credentials.from_service_account_info(
+                st.secrets["gcp_service_account"],
+                scopes=["https://www.googleapis.com/auth/spreadsheets"]
+            )
+            gc = gspread.authorize(creds)
+            sh = gc.open_by_url(st.secrets["sheets"]["portfolio_sheet_url"])
+            st.success(f"✓ Can open Portfolio sheet: {sh.title}")
+            sh2 = gc.open_by_url(st.secrets["sheets"]["alerts_sheet_url"])
+            st.success(f"✓ Can open Alerts sheet: {sh2.title}")
+        except Exception as e:
+            st.error(f"Sheets error: {e}")
+    else:
+        st.caption("Click ‘Run check’ to test access (avoids consuming API quota on each refresh).")
