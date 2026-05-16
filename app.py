@@ -372,9 +372,6 @@ edited = st.data_editor(
     num_rows="dynamic",
     width="stretch",
     key="portfolio_editor",
-    column_config={
-        "Notes": st.column_config.TextColumn("Notes"),
-    },
 )
 
 c_save, c_reload = st.columns([1, 1])
