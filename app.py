@@ -366,12 +366,17 @@ def _clean_portfolio(df: pd.DataFrame) -> pd.DataFrame:
 if "portfolio" not in st.session_state:
     st.session_state.portfolio = load_portfolio()
 
+st.session_state.portfolio["Notes"] = st.session_state.portfolio["Notes"].fillna("").astype(str)
+
 st.subheader("Edit your portfolio")
 edited = st.data_editor(
     st.session_state.portfolio,
     num_rows="dynamic",
     width="stretch",
     key="portfolio_editor",
+    column_config={
+        "Notes": st.column_config.TextColumn("Notes"),
+    },
 )
 
 c_save, c_reload = st.columns([1, 1])
