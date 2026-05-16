@@ -2,6 +2,7 @@
 # UNIVERSAL TRACKER — EMA200 (3h) + MACD (daily) + Alerts (12h throttle)
 # Durable storage via Google Sheets (CSV fallback) + Save/Reload buttons
 # NOW with cached Google Sheets reads to avoid 429 rate limits
+# FIXED: yfinance 1.3.0 MultiIndex + 180m interval removed by Yahoo
 # ==============================================
 
 import os
@@ -66,8 +67,6 @@ def _get_sheets_client():
         sa_info = st.secrets["gcp_service_account"]
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
-            # If open_by_url fails, uncomment Drive scope below and enable Drive API in GCP:
-            # "https://www.googleapis.com/auth/drive",
         ]
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         gc = gspread.authorize(creds)
@@ -239,36 +238,76 @@ def record_alert(key):
 
 # ---------------------------------
 # Data fetchers
+# FIX: ensure_cols flattens MultiIndex produced by yfinance 1.3.0
 # ---------------------------------
 def ensure_cols(df):
+    """Flatten MultiIndex columns that yfinance 1.3.0 returns for single tickers."""
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
 
+# FIX: Yahoo dropped 180m — fetch 1h and resample to 3h
 @st.cache_data(ttl=900)
 def fetch_3h(sym):
-    df = yf.download(sym, period="730d", interval="180m", progress=False, auto_adjust=False)
-    return ensure_cols(df).dropna() if not df.empty else df
+    try:
+        df = yf.download(sym, period="730d", interval="1h", progress=False, auto_adjust=False)
+        df = ensure_cols(df)
+        if df.empty or "Close" not in df.columns:
+            return pd.DataFrame()
+        df.index = pd.to_datetime(df.index)
+        df = df.resample("3h").last().dropna()
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(ttl=900)
 def fetch_60m(sym):
-    df = yf.download(sym, period="730d", interval="60m", progress=False, auto_adjust=False)
-    return ensure_cols(df).dropna() if not df.empty else df
+    try:
+        df = yf.download(sym, period="730d", interval="60m", progress=False, auto_adjust=False)
+        df = ensure_cols(df)
+        if df.empty or "Close" not in df.columns:
+            return pd.DataFrame()
+        return df.dropna()
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(ttl=900)
 def fetch_daily(sym, period="400d"):
-    df = yf.download(sym, period=period, interval="1d", progress=False, auto_adjust=False)
-    return ensure_cols(df).dropna() if not df.empty else df
+    try:
+        df = yf.download(sym, period=period, interval="1d", progress=False, auto_adjust=False)
+        df = ensure_cols(df)
+        if df.empty or "Close" not in df.columns:
+            return pd.DataFrame()
+        return df.dropna()
+    except Exception:
+        return pd.DataFrame()
 
+# FIX: yfinance 1.3.0 MultiIndex makes df["Close"].iloc[-1] a Series → crash
+# Now using ensure_cols + pd.to_numeric to safely extract a scalar float
 @st.cache_data(ttl=900)
 def fetch_15m_price(sym):
-    df = yf.download(sym, period="7d", interval="15m", progress=False, auto_adjust=False)
-    return float(df["Close"].iloc[-1]) if not df.empty else None
+    try:
+        df = yf.download(sym, period="7d", interval="15m", progress=False, auto_adjust=False)
+        df = ensure_cols(df)
+        if df.empty or "Close" not in df.columns:
+            return None
+        close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        return float(close.iloc[-1]) if not close.empty else None
+    except Exception:
+        return None
 
+# FIX: same MultiIndex bug for 1m price fetch
 @st.cache_data(ttl=60)
 def fetch_1m_price(sym):
-    df = yf.download(sym, period="2d", interval="1m", progress=False, auto_adjust=False)
-    return float(df["Close"].iloc[-1]) if not df.empty else None
+    try:
+        df = yf.download(sym, period="2d", interval="1m", progress=False, auto_adjust=False)
+        df = ensure_cols(df)
+        if df.empty or "Close" not in df.columns:
+            return None
+        close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        return float(close.iloc[-1]) if not close.empty else None
+    except Exception:
+        return None
 
 def is_crypto(sym):
     return str(sym).upper().endswith("-USD")
@@ -280,9 +319,9 @@ def ema(s, span):
     return s.ewm(span=span, adjust=False).mean()
 
 def macd(series):
-    ema12, ema26 = ema(series,12), ema(series,26)
+    ema12, ema26 = ema(series, 12), ema(series, 26)
     macd_line = ema12 - ema26
-    signal = ema(macd_line,9)
+    signal = ema(macd_line, 9)
     hist = macd_line - signal
     return macd_line, signal, hist
 
@@ -302,12 +341,12 @@ def ema200_3h(sym):
     if not df3.empty and len(df3) >= 210:
         close = pd.to_numeric(df3["Close"], errors="coerce").dropna()
         return float(ema(close, 200).iloc[-1])
-    # fallback: resample from 60m → 180m
+    # fallback: resample from 60m → 3h
     df60 = fetch_60m(sym)
     if not df60.empty:
         close = pd.to_numeric(df60["Close"], errors="coerce").dropna()
         s = pd.Series(close.values, index=pd.to_datetime(close.index))
-        s3h = s.resample("180min").last().dropna()
+        s3h = s.resample("3h").last().dropna()
         if len(s3h) >= 210:
             return float(ema(s3h, 200).iloc[-1])
     return None
@@ -331,13 +370,13 @@ st.subheader("Edit your portfolio")
 edited = st.data_editor(
     st.session_state.portfolio,
     num_rows="dynamic",
-    use_container_width=True,
+    width="stretch",
     key="portfolio_editor",
 )
 
-c_save, c_reload = st.columns([1,1])
+c_save, c_reload = st.columns([1, 1])
 with c_save:
-    if st.button("💾 Save portfolio", use_container_width=True):
+    if st.button("💾 Save portfolio", width="stretch"):
         clean = _clean_portfolio(edited)
         st.session_state.portfolio = clean
         save_portfolio(clean)
@@ -345,8 +384,7 @@ with c_save:
         _safe_rerun()
 
 with c_reload:
-    if st.button("🔁 Reload from storage", use_container_width=True):
-        # Clear only the Sheets read caches; next load will refetch once
+    if st.button("🔁 Reload from storage", width="stretch"):
         _read_portfolio_from_sheets.clear()
         _read_alerts_from_sheets.clear()
         st.session_state.portfolio = load_portfolio()
@@ -389,7 +427,7 @@ with st.spinner("Fetching data…"):
 
         pl_pct = (last_price / buy - 1) * 100 if (last_price is not None and pd.notna(buy) and buy != 0) else None
         pl_amt = (last_price - buy) * qty if (last_price is not None and pd.notna(buy) and pd.notna(qty)) else None
-        invested_amt = (qty * buy) if (pd.notna(qty) and pd.notna(buy)) else None  # NEW: Invested Amount
+        invested_amt = (qty * buy) if (pd.notna(qty) and pd.notna(buy)) else None
 
         below_stop   = (last_price is not None) and pd.notna(stop) and stop > 0 and last_price <= stop
         above_target = (last_price is not None) and pd.notna(target) and target > 0 and last_price >= target
@@ -401,13 +439,13 @@ with st.spinner("Fetching data…"):
                 record_alert(f"{sym}:{key}")
 
         if pl_pct is not None:
-            if pl_pct >= 10: push_alert("PL+10", f"🔔 {sym}: P/L +{pl_pct:.2f}%")
+            if pl_pct >= 10:   push_alert("PL+10", f"🔔 {sym}: P/L +{pl_pct:.2f}%")
             elif pl_pct <= -10: push_alert("PL-10", f"🔔 {sym}: P/L {pl_pct:.2f}%")
-            if 5 <= pl_pct < 10: push_alert("PL+5", f"🔔 {sym}: P/L +{pl_pct:.2f}%")
-            elif -10 < pl_pct <= -5: push_alert("PL-5", f"🔔 {sym}: P/L {pl_pct:.2f}%")
+            if 5 <= pl_pct < 10:      push_alert("PL+5", f"🔔 {sym}: P/L +{pl_pct:.2f}%")
+            elif -10 < pl_pct <= -5:  push_alert("PL-5", f"🔔 {sym}: P/L {pl_pct:.2f}%")
 
         if pct2 is not None:
-            if pct2 >= 3: push_alert("2D+3", f"📈 {sym}: +{pct2:.2f}% in 2 days")
+            if pct2 >= 3:   push_alert("2D+3", f"📈 {sym}: +{pct2:.2f}% in 2 days")
             elif pct2 <= -3: push_alert("2D-3", f"📉 {sym}: {pct2:.2f}% in 2 days")
 
         if below_stop:   push_alert("STOP",   f"⛔ {sym}: {last_price:.2f} ≤ Stop {float(stop):.2f}")
@@ -415,19 +453,18 @@ with st.spinner("Fetching data…"):
 
         signal_note = ""
         if pd.notna(pl_pct):
-            if pl_pct <= -10: signal_note = "Loss >10%"
-            elif pl_pct <= -5: signal_note = "Loss >5%"
-            elif pl_pct >= 10: signal_note = "Gain >10%"
-            elif pl_pct >= 5:  signal_note = "Gain >5%"
+            if pl_pct <= -10:   signal_note = "Loss >10%"
+            elif pl_pct <= -5:  signal_note = "Loss >5%"
+            elif pl_pct >= 10:  signal_note = "Gain >10%"
+            elif pl_pct >= 5:   signal_note = "Gain >5%"
 
         if signal_note == "" and pd.notna(pct2) and (abs(pct2) >= 3):
             signal_note = "2D move >3%"
 
-        # NOTE: Removed MACD numeric columns from UI; kept MACD Trend.
         rows.append({
             "Symbol": sym,
             "Signal": signal_note,
-            "P/L %": None if pl_pct is None else round(pl_pct, 2),  # moved next to Signal in UI (reordered later)
+            "P/L %": None if pl_pct is None else round(pl_pct, 2),
             "2D %": None if pct2 is None else round(pct2, 2),
             "5D %": None if pct5 is None else round(pct5, 2),
             "7D %": None if pct7 is None else round(pct7, 2),
@@ -435,7 +472,7 @@ with st.spinner("Fetching data…"):
             "200 EMA (3h)": None if ema200_val is None else round(ema200_val, 2),
             "Price vs 200 EMA (3h)": ema_state,
             "MACD Trend (daily)": macd_state,
-            "Invested Amount": None if invested_amt is None else round(float(invested_amt), 2),  # NEW position column
+            "Invested Amount": None if invested_amt is None else round(float(invested_amt), 2),
             "Quantity": None if pd.isna(qty) else round(float(qty), 2),
             "Purchase Price": None if pd.isna(buy) else round(float(buy), 2),
             "Stop Level": None if pd.isna(stop) else round(float(stop), 2),
@@ -452,27 +489,22 @@ def _num(x):
     except: return np.nan
 
 if not df_table.empty:
-    # Work on a copy, coerce numerics
     df_sum = df_table.copy()
-    for c in ["Quantity","Purchase Price","Current Price","Invested Amount"]:
+    for c in ["Quantity", "Purchase Price", "Current Price", "Invested Amount"]:
         if c in df_sum.columns:
             df_sum[c] = df_sum[c].apply(_num)
 
-    # Keep only positions where a Purchase Price is provided and Quantity > 0
     mask_positions = df_sum["Purchase Price"].notna() & df_sum["Quantity"].notna() & (df_sum["Quantity"] > 0)
     df_pos = df_sum.loc[mask_positions].copy()
 
-    # Compute invested/current values for these positions only
     if "Invested Amount" not in df_pos.columns:
         df_pos["Invested Amount"] = df_pos["Quantity"] * df_pos["Purchase Price"]
     df_pos["Current Value"] = df_pos["Quantity"] * df_pos["Current Price"]
 
-    # Totals (only purchased positions)
     total_invested = float(np.nansum(df_pos["Invested Amount"])) if not df_pos.empty else 0.0
     total_current  = float(np.nansum(df_pos["Current Value"])) if not df_pos.empty else 0.0
-    overall_ret_pct = (total_current/total_invested - 1) * 100 if total_invested > 0 else 0.0
+    overall_ret_pct = (total_current / total_invested - 1) * 100 if total_invested > 0 else 0.0
 
-    # Daily portfolio value change % (position-weighted, only purchased positions)
     daily_prev_total = 0.0
     daily_curr_total = 0.0
     for _, r in df_pos.iterrows():
@@ -494,47 +526,41 @@ if not df_table.empty:
                 daily_curr_total += q * curr
     daily_change_pct = (daily_curr_total / daily_prev_total - 1) * 100 if daily_prev_total > 0 else 0.0
 
-    # Top 3 holdings (%) among purchased positions
     top3_share_pct = 0.0
     if total_current > 0 and not df_pos.empty:
-        weights = (df_pos.assign(weight=lambda d: d["Current Value"]/total_current * 100)
+        weights = (df_pos.assign(weight=lambda d: d["Current Value"] / total_current * 100)
                         .sort_values("weight", ascending=False)["weight"])
         top3_share_pct = float(weights.head(3).sum())
 
-    # Render header metrics
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Overall Portfolio Value", f"{total_current:,.2f}")
     m2.metric("Overall % (Invested vs Current)", f"{overall_ret_pct:+.2f}%")
     m3.metric("Daily Portfolio Change", f"{daily_change_pct:+.2f}%")
     m4.metric("Top 3 Holdings (share)", f"{top3_share_pct:.2f}%")
 
-# Ensure Signal & P/L % placement:
-# - Signal immediately after Symbol (already handled)
-# - P/L % right after Signal
+# Reorder columns so Signal & P/L % sit right after Symbol
 if not df_table.empty and "Signal" in df_table.columns and "Symbol" in df_table.columns and "P/L %" in df_table.columns:
     cols = df_table.columns.tolist()
-    # move Signal next to Symbol (keep existing behavior)
     cols.insert(cols.index("Symbol") + 1, cols.pop(cols.index("Signal")))
-    # move P/L % right after Signal
     cols.insert(cols.index("Symbol") + 2, cols.pop(cols.index("P/L %")))
     df_table = df_table[cols]
 
 # Highlight Symbol column
 def highlight_symbol(row):
-    red = pd.notna(row.get("P/L %")) and row["P/L %"] <= -5
+    red   = pd.notna(row.get("P/L %")) and row["P/L %"] <= -5
     green = pd.notna(row.get("P/L %")) and row["P/L %"] >= 5
-    blue = pd.notna(row.get("2D %")) and abs(row["2D %"]) >= 3
+    blue  = pd.notna(row.get("2D %")) and abs(row["2D %"]) >= 3
     color = ""
-    if red: color = "background-color: lightcoral"
+    if red:   color = "background-color: lightcoral"
     elif green: color = "background-color: lightgreen"
-    elif blue: color = "background-color: lightblue"
+    elif blue:  color = "background-color: lightblue"
     return [color if col == "Symbol" else "" for col in df_table.columns]
 
 format_dict = {"2D %": "{:.2f}%", "5D %": "{:.2f}%", "7D %": "{:.2f}%", "P/L %": "{:.2f}%"}
 styled_table = df_table.style.apply(highlight_symbol, axis=1).format(format_dict).format(precision=2)
 
 # ---------------------------------
-# Alerts Panel with Reset (clears Sheets + CSV)
+# Alerts Panel with Reset
 # ---------------------------------
 st.subheader("🔔 Alerts (12h throttle)")
 c1, c2 = st.columns([3, 1])
@@ -546,14 +572,13 @@ with c1:
         st.info("No new alerts this refresh.")
 with c2:
     if st.button("🔄 Reset Alerts"):
-        empty_df = pd.DataFrame(columns=["key","timestamp"])
+        empty_df = pd.DataFrame(columns=["key", "timestamp"])
         try:
             if os.path.exists(ALERTS_LOG):
                 os.remove(ALERTS_LOG)
         except Exception:
             pass
         save_alert_log(empty_df)
-        # reset in-memory
         alert_log = empty_df
         st.success("Alert history cleared ✅")
 
@@ -562,7 +587,7 @@ with c2:
 # ---------------------------------
 if not df_table.empty:
     st.subheader("Portfolio & Signals")
-    st.dataframe(styled_table, use_container_width=True)
+    st.dataframe(styled_table, width="stretch")
     st.download_button(
         "Download Full Report CSV",
         df_table.to_csv(index=False).encode("utf-8"),
@@ -596,4 +621,4 @@ with st.expander("🔎 Google Sheets connection check", expanded=False):
         except Exception as e:
             st.error(f"Sheets error: {e}")
     else:
-        st.caption("Click ‘Run check’ to test access (avoids consuming API quota on each refresh).")
+        st.caption("Click 'Run check' to test access (avoids consuming API quota on each refresh).")
