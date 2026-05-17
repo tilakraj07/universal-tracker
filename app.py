@@ -631,3 +631,58 @@ with st.expander("🔎 Google Sheets connection check", expanded=False):
             st.error(f"Sheets error: {e}")
     else:
         st.caption("Click 'Run check' to test access (avoids consuming API quota on each refresh).")
+
+# ---------------------------------
+# 📊 Gainers & Losers Chart (±10% filter)
+# ---------------------------------
+st.subheader("📊 Big Movers — Stocks with >10% Gain or >10% Loss")
+
+if not df_table.empty and "P/L %" in df_table.columns:
+    df_movers = df_table[["Symbol", "P/L %"]].copy()
+    df_movers["P/L %"] = pd.to_numeric(df_movers["P/L %"], errors="coerce")
+    df_movers = df_movers.dropna(subset=["P/L %"])
+
+    df_movers = df_movers[
+        (df_movers["P/L %"] >= 10) | (df_movers["P/L %"] <= -10)
+    ].sort_values("P/L %", ascending=True).reset_index(drop=True)
+
+    if df_movers.empty:
+        st.info("No stocks with ≥10% gain or ≤-10% loss in your portfolio right now.")
+    else:
+        import plotly.graph_objects as go
+
+        colors = [
+            "crimson" if v < 0 else "mediumseagreen"
+            for v in df_movers["P/L %"]
+        ]
+
+        fig = go.Figure(go.Bar(
+            x=df_movers["P/L %"],
+            y=df_movers["Symbol"],
+            orientation="h",
+            marker_color=colors,
+            text=[f"{v:+.2f}%" for v in df_movers["P/L %"]],
+            textposition="outside",
+            hovertemplate="<b>%{y}</b><br>P/L: %{x:.2f}%<extra></extra>",
+        ))
+
+        fig.update_layout(
+            title="Holdings with >10% Gain / Loss (vs Purchase Price)",
+            xaxis_title="P/L %",
+            yaxis_title="Symbol",
+            xaxis=dict(
+                zeroline=True,
+                zerolinewidth=2,
+                zerolinecolor="gray",
+                ticksuffix="%",
+            ),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            height=max(300, len(df_movers) * 55),
+            margin=dict(l=20, r=80, t=50, b=40),
+            font=dict(size=13),
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("Portfolio data not available for chart.")
