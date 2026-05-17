@@ -7,3 +7,4 @@ gspread-dataframe==4.0.0
 requests==2.34.2
 streamlit-autorefresh==1.0.1
 google-auth==2.53.0
+plotly
