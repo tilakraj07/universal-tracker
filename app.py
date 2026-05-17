@@ -424,11 +424,11 @@ with st.spinner("Fetching data…"):
             if len(close) >= 6: pct5 = (close.iloc[-1] / close.iloc[-6] - 1) * 100
             if len(close) >= 8: pct7 = (close.iloc[-1] / close.iloc[-8] - 1) * 100
 
-        qty    = row.get("Quantity", np.nan)
-        buy    = row.get("Purchase Price", np.nan)
-        stop   = row.get("Stop Level", np.nan)
-        target = row.get("Target Price", np.nan)
-        notes  = row.get("Notes", "")
+        qty    = _num(row.get("Quantity", np.nan))
+        buy    = _num(row.get("Purchase Price", np.nan))
+        stop   = _num(row.get("Stop Level", np.nan))
+        target = _num(row.get("Target Price", np.nan))
+        notes  = str(row.get("Notes", "") or "")
 
         pl_pct = (last_price / buy - 1) * 100 if (last_price is not None and pd.notna(buy) and buy != 0) else None
         pl_amt = (last_price - buy) * qty if (last_price is not None and pd.notna(buy) and pd.notna(qty)) else None
