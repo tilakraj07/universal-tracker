@@ -312,6 +312,10 @@ def fetch_1m_price(sym):
 def is_crypto(sym):
     return str(sym).upper().endswith("-USD")
 
+def _num(x):
+    try: return float(x)
+    except: return np.nan
+
 # ---------------------------------
 # Indicators
 # ---------------------------------
