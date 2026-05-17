@@ -11,6 +11,7 @@ import numpy as np
 import yfinance as yf
 import streamlit as st
 import requests
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from streamlit_autorefresh import st_autorefresh
 
@@ -649,7 +650,7 @@ if not df_table.empty and "P/L %" in df_table.columns:
     if df_movers.empty:
         st.info("No stocks with ≥10% gain or ≤-10% loss in your portfolio right now.")
     else:
-        import plotly.graph_objects as go
+        pass  # plotly imported at top
 
         colors = [
             "crimson" if v < 0 else "mediumseagreen"
